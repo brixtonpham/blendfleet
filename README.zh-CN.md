@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <strong>将 10 个免费 Google Colab 账号 + 你的 Mac 聚合成一台实时 Blender GPU 渲染集群。只需运行 <code>blendfleet fly</code>。</strong>
+  <strong>将你所有的 Google Colab 账号 + 本地显卡聚合成一台实时 Blender GPU 渲染集群。只需运行 <code>blendfleet fly</code>。</strong>
 </p>
 
 <p align="center">
@@ -55,7 +55,7 @@ pip install git+https://github.com/brixtonpham/blendfleet.git
 
 ## 登录一次 → 随时起飞
 
-每个 Google 账号只需完成一次授权——凭据以 `0600` 权限保存在本地 `~/.config/blendfleet/accounts/`——之后即可在终端全自动调度多账号 Colab GPU，无需手动打开浏览器标签页。
+可按需绑定任意数量的 Google 账号——每个账号仅需授权一次，全程无需手动复制粘贴验证码（本地 PKCE loopback OAuth 自动回跳）。凭据以 `0600` 权限保存在 `~/.config/blendfleet/accounts/`，之后即可在终端无头调度多账号 Colab GPU，无需保留浏览器标签页。
 
 ### 1. 一次性绑定 Google 账号
 
@@ -63,7 +63,7 @@ pip install git+https://github.com/brixtonpham/blendfleet.git
 # 查看本地 Chrome 配置文件（可选）
 blendfleet account chrome-profiles
 
-# 逐个授权账号（自动打开对应的 Chrome 配置文件）
+# 逐个授权账号（自动打开对应 Chrome 配置文件，点击允许即可自动完成）
 blendfleet account add acc1 --chrome-profile "Profile 1"
 blendfleet account add acc2 --chrome-profile "Profile 2"
 blendfleet account add acc3 --chrome-profile "Profile 3"
@@ -90,7 +90,7 @@ blendfleet fly scene.blend \
 ```
 
 `blendfleet fly` 会自动完成全部流程：
-1. 在本地启动 HTTP 工作窃取协调器，并通过 `cloudflared` Quick Tunnel 暴露带一次性 Bearer Token 的公网地址。
+1. 在本地启动 HTTP 工作窃取协调器，通过隔离模式（`--config /dev/null`，不干扰现有 `~/.cloudflared/config.yml`）打开带一次性 Bearer Token 的 `cloudflared` Quick Tunnel，并先确认 `/health` 可达再分配云端 GPU。
 2. 为每个选定账号（`--accounts all` 或 `--accounts acc1,acc2`）无头拉起 Colab GPU 实例，并同时挂载本地 GPU（`--local-workers 1`）。
 3. 每个节点仅传输一次 `scene.blend`，在单 GPU 上维持常驻 `bpy` 进程连续出帧；任意 Colab 实例断线时自动回收帧租约；写入前原子校验 PNG/EXR 文件头；结束后自动释放 Colab 实例并调用硬件加速 FFmpeg 合成 `final.mp4`。
 
@@ -127,7 +127,7 @@ git clone --depth 1 https://github.com/brixtonpham/blendfleet.git ~/.cache/blend
 
 ```text
                       ┌──────────────────────────────────────────┐
-                      │       blendfleet fly / serve --tunnel     │
+                      │      blendfleet fly / serve --tunnel     │
                       │  • 仅分发一次 .blend（SHA-256 缓存）      │
                       │  • 动态帧租约 + 心跳续期                  │
                       │  • 节点掉线后自动回收未完成帧              │
@@ -145,18 +145,20 @@ git clone --depth 1 https://github.com/brixtonpham/blendfleet.git ~/.cache/blend
                    └──────────────┘ └────────────┘ └────────────┘
 ```
 
-### 热帧提速 20×（告别逐帧重启 Blender）
+### 热帧提速 8×–20×（告别逐帧重启 Blender）
 
-在 **Blender 5.2.3 LTS** 上的实测数据：
-- **逐帧冷启动**（传统 `blender -b` 循环）：每帧耗费 **`1.44s–8.58s`** 用于重复加载 `.blend`、解包贴图和重建 BVH/OptiX 着色器缓存。
-- **常驻 `bpy` 循环**（`blendfleet`）：热帧仅需 **`0.33s`**——帧间额外开销降低最高 **20×**，因为每个工作节点只启动**一次** Blender（`blender -b scene.blend -P blender_worker.py`）并在内存中连续拉取帧任务。
+在 **Blender 5.2.3 LTS** 上的真实云端与本地实测数据：
+- **Google Colab 免费 `Tesla T4`（`CYCLES/OPTIX`，640×360，16 samples）：** 第 1 帧冷启动 **`4.32s`** → 第 2–4 帧热帧仅 **`0.54s–0.67s`**（常驻 `bpy` 进程提速 **~8×**）。
+- **本地 Apple M3 Max（`CYCLES/METAL`）：** 第 1 帧冷启动 **`1.44s–8.58s`** → 热帧 **`0.33s`**（最高降低 **20×** 帧间额外开销）。
+
+每个工作节点只启动**一次** Blender（`blender -b scene.blend -P blender_worker.py`），`.blend` 加载、贴图解包与 OptiX/Metal 着色器编译每卡仅执行一次。
 
 ### 与传统 Colab Blender Notebook 对比
 
 | 维度 | 传统 Colab Notebook | `blendfleet` |
 |---|---|---|
-| Blender 进程模型 | 每帧重启 `blender -b`（`1.44s–8.58s` 开销） | **常驻 `bpy` 循环**（`0.33s` 热帧） |
-| 多账号调度 | 每次手动开多标签页 + 逐个点击 Drive OAuth | **登录一次 → `blendfleet fly --accounts all`** |
+| Blender 进程模型 | 每帧重启 `blender -b`（`1.44s–8.58s` 开销） | **常驻 `bpy` 循环**（M3 Max `0.33s` / Colab T4 `0.54s` 热帧） |
+| 多账号调度 | 每次手动开多标签页 + 逐个点击 Drive OAuth | **登录一次（免复制粘贴）→ `blendfleet fly --accounts all`** |
 | 帧分配策略 | 静态切分帧段（快卡提前完工干等） | **动态工作窃取** + TTL 租约与心跳 |
 | 共享网盘锁冲突 | Drive FUSE 2–10 秒同步延迟导致 `.tmp` 竞态 | **HTTP 协调器**（或两阶段取模 + `O_CREAT\|O_EXCL`） |
 | 断连 / 90 分钟超时 | 丢帧需人工排查补渲 | **过期租约自动回收** + PNG/EXR 魔数原子校验 |
@@ -169,7 +171,7 @@ Blender Cycles 依赖的是**硬件光线追踪核心**（`OPTIX` / `METAL`）�
 | 算力节点 | 典型成本 | 渲染后端 | 选型建议 |
 |---|---|---|---|
 | **Apple M3 Max（本地）** | 免费 | `METAL`（Metal RT） | 速度约为单卡 Colab `T4` 的 2.8×，建议配合 `--local-workers 1` 混跑。 |
-| **Colab `T4` (16 GB)** | 免费（0 CCU） | `OPTIX`（Turing RT） | 适合聚合 3–10 个免费账号，或用于释放本地内存与显卡。 |
+| **Colab `T4` (16 GB)** | 免费（0 CCU） | `OPTIX`（Turing RT） | 适合聚合多个免费账号（`blendfleet` 不限制账号数量），或用于释放本地内存与显卡。 |
 | **Colab `L4` (24 GB)** | ~1.71 CCU/小时 | `OPTIX`（Ada RT） | CCU 性价比最高（每 1,000 CCU 约可跑 580 小时）。 |
 | **Colab `G4` (96 GB)** | ~8.8 CCU/小时 | `OPTIX`（Blackwell RT） | 适合重度 4K / 高显存场景（约为 M3 Max 的 3.5×）。 |
 | **Colab `A100` / `H100`** | 5.4–18.0 CCU/小时 | 仅 `CUDA`（**无 RT 核心**） | **不建议用于 Cycles**——单位 CCU 光追性价比极低。 |

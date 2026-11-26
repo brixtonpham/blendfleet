@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <strong>Turn 10 free Google Colab accounts + your Mac into one live Blender GPU fleet. Just run <code>blendfleet fly</code>.</strong>
+  <strong>Turn all your Google Colab accounts + your local GPU into one live Blender render fleet. Just run <code>blendfleet fly</code>.</strong>
 </p>
 
 <p align="center">
@@ -55,7 +55,7 @@ pip install git+https://github.com/brixtonpham/blendfleet.git
 
 ## Login Once → Fly Forever
 
-Register each Google account once — credentials stay local in `~/.config/blendfleet/accounts/` (`0600`) — and dispatch multi-account Colab GPU fleets from your terminal with zero browser tabs to babysit.
+Register as many Google accounts as you want — once each, with zero code copy-pasting (PKCE loopback OAuth redirects back automatically). Credentials stay local in `~/.config/blendfleet/accounts/` (`0600`), and every render after that runs headlessly from your terminal with zero browser tabs.
 
 ### 1. Register your Google accounts once
 
@@ -63,7 +63,7 @@ Register each Google account once — credentials stay local in `~/.config/blend
 # Inspect your local Chrome profiles (optional)
 blendfleet account chrome-profiles
 
-# Authenticate each account once (opens the matching Chrome profile)
+# Authenticate each account once (opens the matching Chrome profile — just click Allow)
 blendfleet account add acc1 --chrome-profile "Profile 1"
 blendfleet account add acc2 --chrome-profile "Profile 2"
 blendfleet account add acc3 --chrome-profile "Profile 3"
@@ -90,7 +90,7 @@ blendfleet fly scene.blend \
 ```
 
 What `blendfleet fly` does automatically:
-1. Starts the local HTTP work-stealing coordinator and opens a `cloudflared` Quick Tunnel with an ephemeral bearer token.
+1. Starts the local HTTP work-stealing coordinator, opens an isolated `cloudflared` Quick Tunnel (`--config /dev/null`, safe alongside existing Cloudflare tunnels) with an ephemeral bearer token, and verifies `/health` before provisioning any GPU.
 2. Spawns headless Colab GPU runtimes across every selected account (`--accounts all` or `--accounts acc1,acc2`) and attaches your local GPU (`--local-workers 1`).
 3. Streams `scene.blend` once per worker, keeps one persistent `bpy` process alive per GPU, reclaims frames if any Colab VM disconnects, validates PNG/EXR headers atomically, tears down Colab VMs cleanly on exit, and stitches `final.mp4` via hardware-accelerated FFmpeg.
 
@@ -127,7 +127,7 @@ git clone --depth 1 https://github.com/brixtonpham/blendfleet.git ~/.cache/blend
 
 ```text
                       ┌──────────────────────────────────────────┐
-                      │       blendfleet fly / serve --tunnel     │
+                      │      blendfleet fly / serve --tunnel     │
                       │  • Serves .blend once (SHA-256 cached)   │
                       │  • Dynamic frame leases + heartbeats     │
                       │  • Auto-reclaims frames from dead VMs    │
@@ -145,18 +145,20 @@ git clone --depth 1 https://github.com/brixtonpham/blendfleet.git ~/.cache/blend
                    └──────────────┘ └────────────┘ └────────────┘
 ```
 
-### 20× Faster Warm Frames (Zero Per-Frame Restarts)
+### 8×–20× Faster Warm Frames (Zero Per-Frame Restarts)
 
-Measured on **Blender 5.2.3 LTS**:
-- **Cold startup per frame** (legacy `blender -b` loop): **`1.44s–8.58s`** spent reloading `.blend`, unpacking textures, and rebuilding BVH/OptiX shader caches on every frame.
-- **Persistent `bpy` loop** (`blendfleet`): **`0.33s`** warm frames — up to **20× lower frame overhead**, because each worker launches Blender **once** (`blender -b scene.blend -P blender_worker.py`) and pulls frames back-to-back in memory.
+Measured live on **Blender 5.2.3 LTS**:
+- **Google Colab Free `Tesla T4` (`CYCLES/OPTIX`, 640×360, 16 samples):** cold Frame 1 **`4.32s`** → warm Frames 2–4 **`0.54s–0.67s`** (**~8× faster** per frame inside one persistent `bpy` process).
+- **Local Apple M3 Max (`CYCLES/METAL`):** cold Frame 1 **`1.44s–8.58s`** → warm frames **`0.33s`** (up to **20× lower** frame overhead).
+
+Because each worker launches Blender **once** (`blender -b scene.blend -P blender_worker.py`), `.blend` loading, texture unpacking, and OptiX/Metal shader compilation happen only once per GPU.
 
 ### Comparison vs Legacy Colab Blender Notebooks
 
 | Capability | Legacy Colab Notebooks | `blendfleet` |
 |---|---|---|
-| Blender process lifecycle | Restarts `blender -b` every frame (`1.44s–8.58s` tax) | **Persistent `bpy` loop** (`0.33s` warm frames) |
-| Multi-account execution | Manual browser tabs + Drive OAuth clicks per session | **Login once → `blendfleet fly --accounts all`** |
+| Blender process lifecycle | Restarts `blender -b` every frame (`1.44s–8.58s` tax) | **Persistent `bpy` loop** (`0.33s` M3 Max / `0.54s` Colab T4 warm frames) |
+| Multi-account execution | Manual browser tabs + Drive OAuth clicks per session | **Login once (0 copy-paste) → `blendfleet fly --accounts all`** |
 | Frame distribution | Static range splits (fast GPUs sit idle) | **Dynamic work-stealing** with TTL leases + heartbeats |
 | Shared Drive lock races | `.tmp` file races across 2–10s Drive FUSE sync lag | **HTTP coordinator** (or 2-phase modulo + `O_CREAT\|O_EXCL`) |
 | Disconnect / 90-min timeout | Orphaned frames require manual re-runs | **Automatic stale-lease reclamation** + atomic PNG/EXR checks |
@@ -169,7 +171,7 @@ Cycles relies on **hardware Ray Tracing cores** (`OPTIX` / `METAL`), not Tensor 
 | Runtime | Typical Cost | Backend | Recommendation |
 |---|---|---|---|
 | **Apple M3 Max (Local)** | Free | `METAL` (Metal RT) | ~2.8× faster than a single Colab `T4` — pair with `--local-workers 1`. |
-| **Colab `T4` (16 GB)** | Free (0 CCU) | `OPTIX` (Turing RT) | Ideal when pooled across 3–10 accounts or to keep local RAM/GPU free. |
+| **Colab `T4` (16 GB)** | Free (0 CCU) | `OPTIX` (Turing RT) | Ideal when pooled across multiple accounts (no account limit in `blendfleet`) or to keep local RAM/GPU free. |
 | **Colab `L4` (24 GB)** | ~1.71 CCU/hr | `OPTIX` (Ada RT) | Best CCU efficiency (~580 hrs per 1,000 CCU). |
 | **Colab `G4` (96 GB)** | ~8.8 CCU/hr | `OPTIX` (Blackwell RT) | Best for heavy 4K / high-VRAM scenes (~3.5× faster than M3 Max). |
 | **Colab `A100` / `H100`** | 5.4–18.0 CCU/hr | `CUDA` only (**no RT cores**) | **Skip for Blender Cycles** — poor ray-tracing speed per CCU. |

@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <strong>Biến 10 tài khoản Google Colab miễn phí + máy Mac của bạn thành một dàn GPU render Blender trực tiếp. Chỉ cần chạy <code>blendfleet fly</code>.</strong>
+  <strong>Biến mọi tài khoản Google Colab + GPU máy bạn thành một dàn render Blender trực tiếp. Chỉ cần chạy <code>blendfleet fly</code>.</strong>
 </p>
 
 <p align="center">
@@ -55,7 +55,7 @@ pip install git+https://github.com/brixtonpham/blendfleet.git
 
 ## Đăng nhập 1 lần → Render không giới hạn
 
-Thêm từng tài khoản Google một lần duy nhất — thông tin đăng nhập lưu cục bộ tại `~/.config/blendfleet/accounts/` với quyền `0600` — rồi điều phối cả dàn GPU Colab ngay từ terminal mà không phải mở tab trình duyệt.
+Thêm bao nhiêu tài khoản Google tùy thích — mỗi tài khoản chỉ cần đăng nhập 1 lần duy nhất, không cần copy-paste mã (OAuth PKCE loopback tự động chuyển hướng về máy). Thông tin đăng nhập lưu cục bộ tại `~/.config/blendfleet/accounts/` với quyền `0600`, và mọi lần render sau chạy hoàn toàn từ terminal mà không cần mở tab trình duyệt.
 
 ### 1. Thêm tài khoản Google
 
@@ -63,7 +63,7 @@ Thêm từng tài khoản Google một lần duy nhất — thông tin đăng nh
 # Liệt kê các profile Chrome trên máy (tùy chọn)
 blendfleet account chrome-profiles
 
-# Đăng nhập từng tài khoản một lần (mở đúng profile Chrome tương ứng)
+# Đăng nhập từng tài khoản một lần (mở đúng profile Chrome — chỉ cần bấm Allow)
 blendfleet account add acc1 --chrome-profile "Profile 1"
 blendfleet account add acc2 --chrome-profile "Profile 2"
 blendfleet account add acc3 --chrome-profile "Profile 3"
@@ -90,7 +90,7 @@ blendfleet fly scene.blend \
 ```
 
 `blendfleet fly` tự động thực hiện trọn gói:
-1. Mở HTTP coordinator chia tải trên máy cục bộ kèm `cloudflared` Quick Tunnel bảo vệ bằng bearer token dùng một lần.
+1. Mở HTTP coordinator chia tải trên máy cục bộ kèm `cloudflared` Quick Tunnel cô lập (`--config /dev/null`, không đụng với `~/.cloudflared/config.yml` sẵn có), bảo vệ bằng bearer token dùng một lần và kiểm tra `/health` thông suốt trước khi khởi tạo GPU.
 2. Khởi tạo runtime GPU Colab headless trên toàn bộ tài khoản đã chọn (`--accounts all` hoặc `--accounts acc1,acc2`) và gắn thêm GPU máy cục bộ (`--local-workers 1`).
 3. Truyền `scene.blend` đúng 1 lần cho mỗi worker, giữ một tiến trình `bpy` chạy liên tục trên mỗi GPU, tự thu hồi frame nếu một VM Colab ngắt kết nối, kiểm tra header PNG/EXR nguyên tử, tắt sạch VM Colab khi xong và ghép `final.mp4` bằng FFmpeg tăng tốc phần cứng.
 
@@ -127,7 +127,7 @@ git clone --depth 1 https://github.com/brixtonpham/blendfleet.git ~/.cache/blend
 
 ```text
                       ┌──────────────────────────────────────────┐
-                      │       blendfleet fly / serve --tunnel     │
+                      │      blendfleet fly / serve --tunnel     │
                       │  • Gửi .blend 1 lần (cache SHA-256)      │
                       │  • Cấp lease từng frame + heartbeat      │
                       │  • Tự thu hồi frame khi VM ngắt kết nối  │
@@ -145,18 +145,20 @@ git clone --depth 1 https://github.com/brixtonpham/blendfleet.git ~/.cache/blend
                    └──────────────┘ └────────────┘ └────────────┘
 ```
 
-### Nhanh hơn 20× ở frame nóng (Không khởi động lại Blender từng frame)
+### Nhanh hơn 8×–20× ở frame nóng (Không khởi động lại Blender từng frame)
 
 Đo thực tế trên **Blender 5.2.3 LTS**:
-- **Khởi động lạnh từng frame** (vòng lặp `blender -b` truyền thống): tốn **`1.44s–8.58s`** mỗi frame chỉ để nạp lại `.blend`, giải nén texture và biên dịch lại BVH/shader OptiX.
-- **Vòng lặp `bpy` thường trực** (`blendfleet`): chỉ còn **`0.33s`** mỗi frame nóng — giảm tới **20× chi phí khởi động**, vì mỗi worker chỉ mở Blender **đúng 1 lần** (`blender -b scene.blend -P blender_worker.py`) và kéo frame liên tiếp trong bộ nhớ.
+- **Google Colab Free `Tesla T4` (`CYCLES/OPTIX`, 640×360, 16 samples):** frame 1 lạnh **`4.32s`** → các frame 2–4 nóng chỉ còn **`0.54s–0.67s`** (**nhanh hơn ~8×** trong cùng 1 tiến trình `bpy`).
+- **Apple M3 Max cục bộ (`CYCLES/METAL`):** frame 1 lạnh **`1.44s–8.58s`** → frame nóng **`0.33s`** (giảm tới **20×** chi phí khởi động).
+
+Mỗi worker chỉ mở Blender **đúng 1 lần** (`blender -b scene.blend -P blender_worker.py`), nên việc nạp `.blend`, giải nén texture và biên dịch shader OptiX/Metal chỉ chạy một lần duy nhất trên mỗi GPU.
 
 ### So sánh với các Notebook Blender Colab cũ
 
 | Hạng mục | Notebook Colab truyền thống | `blendfleet` |
 |---|---|---|
-| Vòng đời tiến trình Blender | Mở lại `blender -b` mỗi frame (tốn `1.44s–8.58s`) | **Vòng lặp `bpy` thường trực** (`0.33s` mỗi frame nóng) |
-| Chạy nhiều tài khoản | Mở thủ công nhiều tab + bấm cấp quyền Drive mỗi phiên | **Đăng nhập 1 lần → `blendfleet fly --accounts all`** |
+| Vòng đời tiến trình Blender | Mở lại `blender -b` mỗi frame (tốn `1.44s–8.58s`) | **Vòng lặp `bpy` thường trực** (`0.33s` M3 Max / `0.54s` Colab T4) |
+| Chạy nhiều tài khoản | Mở thủ công nhiều tab + bấm cấp quyền Drive mỗi phiên | **Đăng nhập 1 lần (không copy-paste) → `blendfleet fly --accounts all`** |
 | Phân bổ frame | Chia dải tĩnh (GPU mạnh xong trước ngồi chờ) | **Work-stealing động** với TTL lease + heartbeat |
 | Xung đột khóa Google Drive | Lỗi tranh chấp file `.tmp` do độ trễ đồng bộ Drive 2–10s | **HTTP coordinator** (hoặc chia modulo 2 pha + `O_CREAT\|O_EXCL`) |
 | Rớt kết nối / giới hạn 90 phút | Mất frame giữa chừng phải chạy bù thủ công | **Tự thu hồi lease hết hạn** + kiểm tra byte header PNG/EXR |
@@ -169,7 +171,7 @@ Cycles tận dụng **nhân Ray Tracing phần cứng** (`OPTIX` / `METAL`), kh�
 | Phần cứng | Chi phí tham khảo | Backend | Khuyến nghị |
 |---|---|---|---|
 | **Apple M3 Max (Máy cục bộ)** | Miễn phí | `METAL` (Metal RT) | Nhanh hơn ~2.8× so với 1 Colab `T4` — chạy kèm `--local-workers 1`. |
-| **Colab `T4` (16 GB)** | Miễn phí (0 CCU) | `OPTIX` (Turing RT) | Rất tốt khi gộp 3–10 tài khoản hoặc muốn giữ trống RAM/GPU máy cá nhân. |
+| **Colab `T4` (16 GB)** | Miễn phí (0 CCU) | `OPTIX` (Turing RT) | Rất tốt khi gộp nhiều tài khoản (`blendfleet` không giới hạn số tài khoản) hoặc muốn giữ trống RAM/GPU máy cá nhân. |
 | **Colab `L4` (24 GB)** | ~1.71 CCU/giờ | `OPTIX` (Ada RT) | Hiệu quả CCU cao nhất (~580 giờ cho mỗi 1.000 CCU). |
 | **Colab `G4` (96 GB)** | ~8.8 CCU/giờ | `OPTIX` (Blackwell RT) | Tốt nhất cho cảnh 4K nặng / tốn VRAM (~3.5× nhanh hơn M3 Max). |
 | **Colab `A100` / `H100`** | 5.4–18.0 CCU/giờ | Chỉ `CUDA` (**không có nhân RT**) | **Nên tránh cho Cycles** — hiệu năng ray-tracing trên mỗi CCU rất thấp. |
