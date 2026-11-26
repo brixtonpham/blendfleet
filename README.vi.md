@@ -38,8 +38,8 @@ uv tool install git+https://github.com/brixtonpham/blendfleet.git
 # 2. Tùy chọn: chạy dàn Colab đa tài khoản headless + tunnel
 uv tool install google-colab-cli && brew install cloudflared
 
-# 3. Tùy chọn: cài Agent Skill chính thức (Claude Code / Antigravity / Codex / OpenCode)
-ccp install https://github.com/brixtonpham/blendfleet --link .
+# 3. Tùy chọn: cài Agent Skill chính thức (Claude Code / Cursor / Codex / Antigravity)
+npx skills add brixtonpham/blendfleet
 ```
 
 <details>
@@ -103,8 +103,11 @@ blendfleet fly scene.blend \
 ### Cài đặt Skill
 
 ```bash
-# Bằng ccp (khuyên dùng)
-ccp install https://github.com/brixtonpham/blendfleet --link .
+# Cài chuẩn cho mọi agent (Claude Code, Cursor, Codex, Antigravity, OpenCode)
+npx skills add brixtonpham/blendfleet
+
+# Hoặc bằng ccp (https://github.com/samhvw8/claude-code-profile)
+ccp install https://github.com/brixtonpham/blendfleet --all --link .
 
 # Hoặc sao chép trực tiếp vào thư mục skills của agent
 git clone --depth 1 https://github.com/brixtonpham/blendfleet.git ~/.cache/blendfleet-repo \

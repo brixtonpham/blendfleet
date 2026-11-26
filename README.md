@@ -38,8 +38,8 @@ uv tool install git+https://github.com/brixtonpham/blendfleet.git
 # 2. Optional: headless multi-account Colab fleet + tunnel
 uv tool install google-colab-cli && brew install cloudflared
 
-# 3. Optional: install the official Agent Skill (Claude Code / Antigravity / Codex / OpenCode)
-ccp install https://github.com/brixtonpham/blendfleet --link .
+# 3. Optional: install the official Agent Skill (Claude Code / Cursor / Codex / Antigravity)
+npx skills add brixtonpham/blendfleet
 ```
 
 <details>
@@ -103,8 +103,11 @@ What `blendfleet fly` does automatically:
 ### Install the Skill
 
 ```bash
-# With ccp (recommended)
-ccp install https://github.com/brixtonpham/blendfleet --link .
+# Universal installer (Claude Code, Cursor, Codex, Antigravity, OpenCode)
+npx skills add brixtonpham/blendfleet
+
+# Or with ccp (https://github.com/samhvw8/claude-code-profile)
+ccp install https://github.com/brixtonpham/blendfleet --all --link .
 
 # Or copy directly into your agent skills directory
 git clone --depth 1 https://github.com/brixtonpham/blendfleet.git ~/.cache/blendfleet-repo \

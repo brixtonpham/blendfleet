@@ -38,8 +38,8 @@ uv tool install git+https://github.com/brixtonpham/blendfleet.git
 # 2. 可选：多账号无头 Colab 集群 + 隧道组件
 uv tool install google-colab-cli && brew install cloudflared
 
-# 3. 可选：安装官方 Agent Skill（Claude Code / Antigravity / Codex / OpenCode）
-ccp install https://github.com/brixtonpham/blendfleet --link .
+# 3. 可选：安装官方 Agent Skill（Claude Code / Cursor / Codex / Antigravity）
+npx skills add brixtonpham/blendfleet
 ```
 
 <details>
@@ -103,8 +103,11 @@ blendfleet fly scene.blend \
 ### 安装 Skill
 
 ```bash
-# 使用 ccp（推荐）
-ccp install https://github.com/brixtonpham/blendfleet --link .
+# 通用安装方式（Claude Code、Cursor、Codex、Antigravity、OpenCode）
+npx skills add brixtonpham/blendfleet
+
+# 或使用 ccp（https://github.com/samhvw8/claude-code-profile）
+ccp install https://github.com/brixtonpham/blendfleet --all --link .
 
 # 或手动复制到 Agent 的 skills 目录
 git clone --depth 1 https://github.com/brixtonpham/blendfleet.git ~/.cache/blendfleet-repo \
