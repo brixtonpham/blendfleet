@@ -1,141 +1,210 @@
-# blendfleet
+<p align="center">
+  <img src="assets/wordmark.svg" alt="BLENDFLEET" width="520" />
+</p>
 
-**Heterogeneous distributed Blender render farm for ephemeral Google Colab, Kaggle, and local GPUs.**
+<p align="center">
+  <img src="assets/logo.png" alt="BlendFleet Logo" width="150" />
+</p>
 
-`blendfleet` pools free or paid Google Colab GPUs (`T4`, `L4`, `G4`), Kaggle GPUs, and your local Apple Silicon (`Metal`) or NVIDIA (`OptiX`/`CUDA`) machine into one live work-stealing render pool — with **zero external Python dependencies** in its core runtime.
+<p align="center">
+  <strong>Turn 10 free Google Colab accounts + your Mac into one live Blender GPU fleet. Just run <code>blendfleet fly</code>.</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/brixtonpham/blendfleet/releases"><img src="https://img.shields.io/badge/version-v0.2.0-7c3aed?style=flat-square" alt="Version v0.2.0" /></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-10b981?style=flat-square" alt="MIT License" /></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/core%20deps-0-14b8a6?style=flat-square" alt="Core Dependencies: 0" /></a>
+  <a href="https://colab.research.google.com/github/brixtonpham/blendfleet/blob/main/notebooks/blendfleet_worker.ipynb"><img src="https://img.shields.io/badge/Open%20in%20Colab-F9AB00?style=flat-square&logo=googlecolab&logoColor=white" alt="Open in Colab" /></a>
+</p>
+
+<p align="center">
+  <strong>English</strong> | <a href="README.vi.md">Tiếng Việt</a> | <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
+  <strong>blendfleet</strong> pools free and paid Google Colab GPUs (<code>T4</code>, <code>L4</code>, <code>G4</code>), Kaggle GPUs, and your local Apple Silicon or NVIDIA machine into one persistent <code>bpy</code> work-stealing render pool.<br />
+  Log in once per Google account, then run headless multi-GPU renders from your terminal — with zero per-frame Blender restarts and zero external core dependencies.
+</p>
 
 ---
 
-## Why `blendfleet`?
+## Install
 
-Existing multi-account Blender Colab notebooks break in three predictable ways:
+```bash
+# 1. Core CLI (zero Python runtime dependencies)
+uv tool install git+https://github.com/brixtonpham/blendfleet.git
 
-1. **Per-frame Blender restarts** — spawning a fresh `blender -b` subprocess per frame wastes 4–10 seconds reloading the `.blend` file and recompiling OptiX shaders on *every single frame*.
-2. **Drive FUSE lock races & OAuth popups** — mounting Google Drive across 4 accounts requires 4 interactive OAuth consent clicks per session, and Drive's 2–10s cross-account sync lag causes `.tmp` lock files to race.
-3. **Idle fast workers** — static range splits (`1-60`, `61-120`) leave a fast local Apple Silicon Mac or Colab `G4` sitting idle while a slow `T4` grinds through its slice or disconnects at minute 89.
+# 2. Optional: headless multi-account Colab fleet + tunnel
+uv tool install google-colab-cli && brew install cloudflared
 
-`blendfleet` fixes all three:
-
-- **Persistent `bpy` work-stealing loop:** Launches Blender **once** per worker (`blender -b scene.blend -P blender_worker.py`). The `.blend` file loads once and OptiX/Metal shaders compile once; frames stream through the live `bpy` process back-to-back.
-- **Zero-dependency HTTP work-stealing coordinator (`blendfleet serve`):** Serves the `.blend` scene once over `localhost`, Tailscale, or `cloudflared --tunnel`, hands out frames with TTL leases and heartbeats, reclaims frames automatically when a Colab tab disconnects, and validates PNG/EXR magic bytes atomically before committing each frame.
-- **Zero-server Shared Drive fallback (`--mode fs`):** Uses 2-phase interleaved modulo sharding (`frame % N == worker_index`) to eliminate Drive FUSE lock contention, followed by atomic `O_CREAT | O_EXCL` stale-lease tail-sweeping if a worker dies.
-- **GPU-aware backend auto-selection:**
-  - `T4` / `L4` / `G4 (RTX PRO 6000 Blackwell)` / `RTX` → **`OPTIX`** (hardware RT cores)
-  - `A100` / `H100` / `V100` / `P100` → **`CUDA`** (no RT cores on compute-only datacenter cards)
-  - Apple Silicon (`M1`–`M4`) → **`METAL`** (hardware Metal Ray Tracing)
-  - Linux Colab VMs → automatic **`libtcmalloc_minimal`** preload to prevent glibc OOM crashes
-- **Hardware-accelerated FFmpeg stitcher:** Verifies every frame's presence and header bytes before encoding with `h264_videotoolbox` (macOS), `h264_nvenc` (NVIDIA), or `libx264` (including Linear EXR → sRGB gamma).
-
----
-
-## Architecture
-
-```text
-                    ┌──────────────────────────────────────────┐
-                    │   blendfleet serve scene.blend --tunnel    │
-                    │  • Streams .blend once (SHA-256 cached)  │
-                    │  • Dynamic frame leases + heartbeats     │
-                    │  • Auto-reclaims frames from dead tabs   │
-                    │  • Atomic PNG/EXR validation -> ./out    │
-                    └──────┬─────────────┬─────────────┬───────┘
-                           │             │             │
-              localhost    │   HTTPS     │   HTTPS     │   HTTPS
-                           ▼             ▼             ▼
-                 ┌──────────────┐ ┌────────────┐ ┌────────────┐
-                 │ Local Worker │ │ Colab #1   │ │ Colab #2..N│
-                 │ Apple M3 Max │ │ Free T4    │ │ T4 / L4/G4 │
-                 │ Metal RT     │ │ OptiX      │ │ OptiX      │
-                 │ 1x bpy proc  │ │ 1x bpy proc│ │ 1x bpy proc│
-                 └──────────────┘ └────────────┘ └────────────┘
+# 3. Optional: install the official Agent Skill (Claude Code / Antigravity / Codex / OpenCode)
+ccp install https://github.com/brixtonpham/blendfleet --link .
 ```
 
----
-
-## Quick Start
-
-### Install
+<details>
+<summary>Alternative install with <code>pip</code></summary>
 
 ```bash
 pip install git+https://github.com/brixtonpham/blendfleet.git
-# or with uv
-uv tool install git+https://github.com/brixtonpham/blendfleet.git
 ```
 
-### 1. Start the Coordinator (Hybrid Local + Remote Colab Pool)
+</details>
 
-Start a coordinator on your machine, attach 1 local GPU worker, expose it to Colab via a Cloudflare Quick Tunnel (`cloudflared`), and stitch the final MP4 automatically when all frames finish:
+---
+
+## Login Once → Fly Forever
+
+Register each Google account once — credentials stay local in `~/.config/blendfleet/accounts/` (`0600`) — and dispatch multi-account Colab GPU fleets from your terminal with zero browser tabs to babysit.
+
+### 1. Register your Google accounts once
 
 ```bash
-blendfleet serve scene.blend \
+# Inspect your local Chrome profiles (optional)
+blendfleet account chrome-profiles
+
+# Authenticate each account once (opens the matching Chrome profile)
+blendfleet account add acc1 --chrome-profile "Profile 1"
+blendfleet account add acc2 --chrome-profile "Profile 2"
+blendfleet account add acc3 --chrome-profile "Profile 3"
+```
+
+### 2. Check all accounts & CCU balances in parallel
+
+```bash
+blendfleet account check
+```
+
+Verifies every stored account's email, token freshness, and available Colab Compute Units (CCU) concurrently before you start a render.
+
+### 3. Launch the fleet in one command
+
+```bash
+blendfleet fly scene.blend \
   --frames 1-240 \
-  --out ./renders/shot_01 \
+  --out ./out \
+  --accounts all \
+  --gpu T4 \
   --local-workers 1 \
-  --tunnel \
-  --stitch-out ./renders/shot_01.mp4 \
-  --fps 24
+  --stitch-out final.mp4
 ```
 
-`blendfleet serve` prints a ready-to-paste 1-cell Colab/Kaggle snippet containing the tunnel URL and bearer token:
+What `blendfleet fly` does automatically:
+1. Starts the local HTTP work-stealing coordinator and opens a `cloudflared` Quick Tunnel with an ephemeral bearer token.
+2. Spawns headless Colab GPU runtimes across every selected account (`--accounts all` or `--accounts acc1,acc2`) and attaches your local GPU (`--local-workers 1`).
+3. Streams `scene.blend` once per worker, keeps one persistent `bpy` process alive per GPU, reclaims frames if any Colab VM disconnects, validates PNG/EXR headers atomically, tears down Colab VMs cleanly on exit, and stitches `final.mp4` via hardware-accelerated FFmpeg.
 
-```python
-!nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-!apt-get -qq update && apt-get -qq install -y libtcmalloc-minimal4 >/dev/null 2>&1 || true
-!pip -q install git+https://github.com/brixtonpham/blendfleet.git
-!blendfleet worker --mode http \
-  --coordinator-url 'https://<random>.trycloudflare.com' \
-  --token '<token>' \
-  --blender-version '5.2.3'
-```
+---
 
-Paste that cell into as many Google Colab or Kaggle accounts as you want — or open [`notebooks/blendfleet_worker.ipynb`](notebooks/blendfleet_worker.ipynb). Workers join dynamically mid-job and drop out cleanly if disconnected.
+## Agent Skill
 
-### 2. Zero-Server Shared Google Drive Mode (`--mode fs`)
+`blendfleet` ships with an official Agent Skill at [`skills/blendfleet/SKILL.md`](skills/blendfleet/SKILL.md) for Claude Code, Antigravity, Codex, OpenCode, and Cursor.
 
-Prefer no HTTP tunnel? Share one Google Drive folder across $N$ Colab accounts and pass `--worker-index` (`0 .. N-1`) with `--total-workers N`:
+### Install the Skill
 
 ```bash
-# Account 0
+# With ccp (recommended)
+ccp install https://github.com/brixtonpham/blendfleet --link .
+
+# Or copy directly into your agent skills directory
+git clone --depth 1 https://github.com/brixtonpham/blendfleet.git ~/.cache/blendfleet-repo \
+  && cp -R ~/.cache/blendfleet-repo/skills/blendfleet ~/.claude/skills/blendfleet \
+  && rm -rf ~/.cache/blendfleet-repo
+```
+
+### Example Prompts
+
+- *"Check my blendfleet Colab accounts and CCU balances, then render frames 1–240 of `shot_03.blend` across all free T4s plus my Mac and stitch at 24fps."*
+- *"Discover my Chrome profiles, help me add 3 Google accounts to blendfleet, and verify them."*
+- *"Verify `./renders/shot_03` has all 240 frames intact, re-render any missing frames on Colab L4, and stitch `shot_03.mp4`."*
+
+---
+
+## How It Works
+
+```text
+                      ┌──────────────────────────────────────────┐
+                      │       blendfleet fly / serve --tunnel     │
+                      │  • Serves .blend once (SHA-256 cached)   │
+                      │  • Dynamic frame leases + heartbeats     │
+                      │  • Auto-reclaims frames from dead VMs    │
+                      │  • Atomic PNG/EXR validation -> ./out    │
+                      │  • Auto-stitches MP4 on completion       │
+                      └──────┬─────────────┬─────────────┬───────┘
+                             │             │             │
+                localhost    │   HTTPS     │   HTTPS     │   HTTPS
+                             ▼             ▼             ▼
+                   ┌──────────────┐ ┌────────────┐ ┌────────────┐
+                   │ Local Worker │ │ Colab acc1 │ │ Colab 2..N │
+                   │ Apple M3 Max │ │ Free T4    │ │ T4 / L4/G4 │
+                   │ Metal RT     │ │ OptiX      │ │ OptiX      │
+                   │ 1x bpy proc  │ │ 1x bpy proc│ │ 1x bpy proc│
+                   └──────────────┘ └────────────┘ └────────────┘
+```
+
+### 20× Faster Warm Frames (Zero Per-Frame Restarts)
+
+Measured on **Blender 5.2.3 LTS**:
+- **Cold startup per frame** (legacy `blender -b` loop): **`1.44s–8.58s`** spent reloading `.blend`, unpacking textures, and rebuilding BVH/OptiX shader caches on every frame.
+- **Persistent `bpy` loop** (`blendfleet`): **`0.33s`** warm frames — up to **20× lower frame overhead**, because each worker launches Blender **once** (`blender -b scene.blend -P blender_worker.py`) and pulls frames back-to-back in memory.
+
+### Comparison vs Legacy Colab Blender Notebooks
+
+| Capability | Legacy Colab Notebooks | `blendfleet` |
+|---|---|---|
+| Blender process lifecycle | Restarts `blender -b` every frame (`1.44s–8.58s` tax) | **Persistent `bpy` loop** (`0.33s` warm frames) |
+| Multi-account execution | Manual browser tabs + Drive OAuth clicks per session | **Login once → `blendfleet fly --accounts all`** |
+| Frame distribution | Static range splits (fast GPUs sit idle) | **Dynamic work-stealing** with TTL leases + heartbeats |
+| Shared Drive lock races | `.tmp` file races across 2–10s Drive FUSE sync lag | **HTTP coordinator** (or 2-phase modulo + `O_CREAT\|O_EXCL`) |
+| Disconnect / 90-min timeout | Orphaned frames require manual re-runs | **Automatic stale-lease reclamation** + atomic PNG/EXR checks |
+| Core Python dependencies | Heavy notebook pip installs that break Colab pins | **0 external dependencies** (100% Python stdlib core) |
+
+### GPU Selection Matrix for Blender Cycles
+
+Cycles relies on **hardware Ray Tracing cores** (`OPTIX` / `METAL`), not Tensor cores:
+
+| Runtime | Typical Cost | Backend | Recommendation |
+|---|---|---|---|
+| **Apple M3 Max (Local)** | Free | `METAL` (Metal RT) | ~2.8× faster than a single Colab `T4` — pair with `--local-workers 1`. |
+| **Colab `T4` (16 GB)** | Free (0 CCU) | `OPTIX` (Turing RT) | Ideal when pooled across 3–10 accounts or to keep local RAM/GPU free. |
+| **Colab `L4` (24 GB)** | ~1.71 CCU/hr | `OPTIX` (Ada RT) | Best CCU efficiency (~580 hrs per 1,000 CCU). |
+| **Colab `G4` (96 GB)** | ~8.8 CCU/hr | `OPTIX` (Blackwell RT) | Best for heavy 4K / high-VRAM scenes (~3.5× faster than M3 Max). |
+| **Colab `A100` / `H100`** | 5.4–18.0 CCU/hr | `CUDA` only (**no RT cores**) | **Skip for Blender Cycles** — poor ray-tracing speed per CCU. |
+
+Linux Colab VMs also preload `libtcmalloc_minimal` automatically to prevent glibc allocator OOM crashes on long sequences.
+
+---
+
+## Zero-Server Shared Google Drive Mode & Standalone Notebook
+
+### Shared Google Drive / NFS Mode (`--mode fs`)
+
+Need zero HTTP tunnels? Share one Google Drive folder across $N$ Colab or Kaggle accounts and assign `--worker-index 0 .. N-1`:
+
+```bash
+# Account 0 (accounts 1..3 pass --worker-index 1, 2, 3)
 blendfleet worker --mode fs \
   --scene /content/drive/MyDrive/blendfleet_job/scene.blend \
   --out /content/drive/MyDrive/blendfleet_job/frames \
   --frames 1-240 --worker-index 0 --total-workers 4
-
-# Account 1..3 use --worker-index 1, 2, 3
 ```
 
-Each worker stages `.blend` onto local `/content/` NVMe, renders its disjoint modulo shard first (`1, 5, 9…` vs `2, 6, 10…`), and then automatically steals any leftover or stale-leased frames from workers that disconnected early.
+Each worker copies `scene.blend` onto local `/content/` NVMe, renders its disjoint modulo shard first (`frame % N == worker_index`, eliminating Drive FUSE races), then runs an atomic `O_CREAT | O_EXCL` tail-sweep to steal any frames left behind by workers that disconnected early.
 
-### 3. Verify & Stitch Frames
+### Manual Coordinator + Standalone Notebook
+
+You can also run the coordinator directly and paste the printed 1-cell snippet into [`notebooks/blendfleet_worker.ipynb`](notebooks/blendfleet_worker.ipynb) (Colab or Kaggle):
 
 ```bash
-blendfleet verify ./renders/shot_01 --frames 1-240
-blendfleet stitch ./renders/shot_01 --frames 1-240 --fps 24 --out ./renders/shot_01.mp4
+blendfleet serve scene.blend --frames 1-240 --out ./out --local-workers 1 --tunnel --stitch-out final.mp4
 ```
 
-### 4. Multi-Profile Chrome Launch (`bsk`)
-
-If you use [BrowserSkill (`bsk`)](https://github.com/Tencent/BrowserSkill) with multiple logged-in Chrome profiles, open Colab across all of them in one command:
+### Verify & Stitch Anytime
 
 ```bash
-blendfleet colab-launch \
-  --profiles profile-a,profile-b,profile-c \
-  --coordinator-url https://<random>.trycloudflare.com \
-  --token <token>
+blendfleet verify ./out --frames 1-240
+blendfleet stitch ./out --frames 1-240 --fps 24 --out final.mp4
 ```
-
----
-
-## Colab GPU Guide for Blender Cycles
-
-Blender Cycles uses **OptiX hardware Ray Tracing cores**, not Tensor cores:
-
-| Runtime | Typical Cost | Hardware RT Cores | Recommendation |
-|---|---|---|---|
-| **Apple M3 Max (Local)** | Free | Metal RT | ~2.8× faster than a single Colab `T4` — run `--local-workers 1` alongside Colab workers. |
-| **Colab `T4` (16 GB)** | Free (0 CCU) | Turing RT (`OPTIX`) | Great when sharded across 3–5 accounts or to keep local RAM/GPU free. |
-| **Colab `L4` (24 GB)** | ~1.71 CCU/hr | Ada RT (`OPTIX`) | Best CCU efficiency (~580 hrs per 1,000 CCU). |
-| **Colab `G4` (96 GB)** | ~8.8 CCU/hr | Blackwell RT (`OPTIX`) | Best for massive 4K/heavy scenes (~3.5× faster than M3 Max). |
-| **Colab `A100` / `H100`** | 5.4–18.0 CCU/hr | **None** (`CUDA` only) | Avoid for Blender Cycles; poor ray-tracing performance per CCU. |
 
 ---
 
@@ -148,17 +217,18 @@ mise run e2e-local  # run real 2-worker headless Blender + FFmpeg smoke test
 mise run check      # ruff lint + pytest + OKF validation
 ```
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture invariants and PR guidelines.
+
 ---
 
 ## Inspirations & Prior Art
 
-`blendfleet` builds on lessons learned from the open-source Blender-on-Colab ecosystem:
-
 - [`ynshung/blender-colab`](https://github.com/ynshung/blender-colab) — `libtcmalloc` preload and Blender release mirror fallback (`ftp.nluug.nl`).
 - [`cgmaniac/blender-colab-render-suite`](https://github.com/cgmaniac/blender-colab-render-suite) — local NVMe staging, frame-range expressions, and Linear EXR gamma stitching.
-- [`sufianahamd/Blender-Multi-Account-Rendering`](https://github.com/sufianahamd/Blender-Multi-Account-Rendering) — multi-account shared-folder rendering pattern (upgraded here to persistent `bpy` processes + atomic leases).
+- [`sufianahamd/Blender-Multi-Account-Rendering`](https://github.com/sufianahamd/Blender-Multi-Account-Rendering) — multi-account shared-folder rendering pattern (upgraded here to persistent `bpy` + atomic leases).
+- [`googlecolab/google-colab-cli`](https://github.com/googlecolab/google-colab-cli) — headless Colab runtime provisioning from the terminal.
 - [`googlecolab/colab-mcp`](https://github.com/googlecolab/colab-mcp) — browser WebSocket bridge (upgraded with dual-stack IPv4+IPv6 port allocation).
-- [`MUKILAN0608/ColabCluster`](https://github.com/MUKILAN0608/ColabCluster) — heartbeat + lease reconciliation model for ephemeral Colab runtimes.
+- [`MUKILAN0608/ColabCluster`](https://github.com/MUKILAN0608/ColabCluster) — heartbeat and lease reconciliation model for ephemeral Colab runtimes.
 
 ## License
 

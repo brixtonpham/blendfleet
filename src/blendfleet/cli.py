@@ -11,12 +11,21 @@ import time
 from pathlib import Path
 
 from blendfleet import __version__
+from blendfleet.accounts import (
+    add_account,
+    check_all_accounts,
+    list_accounts,
+    list_chrome_profiles,
+    remove_account,
+    resolve_accounts,
+)
 from blendfleet.colab_bridge import (
     build_colab_cell_snippet,
     launch_colab_profiles,
     write_worker_notebook,
 )
 from blendfleet.coordinator import CoordinatorServer, JobState, QuickTunnel
+from blendfleet.fleet import DEFAULT_REPO_URL, SUPPORTED_GPUS, fly_fleet
 from blendfleet.frames import BLENDER_FORMAT_EXT, parse_frame_spec, verify_frame_sequence
 from blendfleet.stitch import stitch_frames
 from blendfleet.worker import run_worker
@@ -218,6 +227,118 @@ def _cmd_colab_launch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_account_add(args: argparse.Namespace) -> int:
+    result = add_account(
+        args.alias,
+        code=args.code,
+        chrome_profile=args.chrome_profile,
+        no_browser=args.no_browser,
+    )
+    if result.get("status") == "saved":
+        email_part = f" ({result['email']})" if result.get("email") else ""
+        print(f"[blendfleet] Saved account '{result['alias']}'{email_part}")
+        print(f"  Credentials : {result['credentials_path']}")
+        print(f"  Sessions    : {result['sessions_path']}")
+    return 0
+
+
+def _cmd_account_list(args: argparse.Namespace) -> int:
+    rows = list_accounts()
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("No saved blendfleet Colab accounts. Add one with: blendfleet account add <alias>")
+        return 0
+    for row in rows:
+        email = row.get("email") or "(unknown email)"
+        profile = f" [chrome: {row['chrome_profile']}]" if row.get("chrome_profile") else ""
+        print(f"{row['alias']:<18} {email}{profile}")
+    return 0
+
+
+def _cmd_account_check(args: argparse.Namespace) -> int:
+    aliases = resolve_accounts(args.accounts)
+    if not aliases:
+        if args.json:
+            print("[]")
+        else:
+            print("No saved blendfleet Colab accounts to check.")
+        return 0
+
+    results = check_all_accounts(aliases)
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        for row in results:
+            status = "OK" if row["ok"] else row["status"].upper()
+            email = row.get("email") or "-"
+            ccu = row.get("ccu_balance")
+            detail = (
+                f"CCU={ccu}"
+                if ccu is not None
+                else (row.get("usage") or "").splitlines()[0]
+                if row.get("usage")
+                else row.get("error") or ""
+            )
+            print(f"{row['alias']:<18} {status:<10} {email:<34} {detail}")
+    return 0 if all(r["ok"] for r in results) else 1
+
+
+def _cmd_account_remove(args: argparse.Namespace) -> int:
+    removed = remove_account(args.alias)
+    if not removed:
+        print(f"[blendfleet] Account '{args.alias}' not found.", file=sys.stderr)
+        return 1
+    print(f"[blendfleet] Removed account '{args.alias}'.")
+    return 0
+
+
+def _cmd_account_chrome_profiles(args: argparse.Namespace) -> int:
+    profiles = list_chrome_profiles()
+    if args.json:
+        print(json.dumps(profiles, indent=2))
+        return 0
+    if not profiles:
+        print("No Chrome profiles found.")
+        return 0
+    for prof in profiles:
+        email_part = f" ({prof['email']})" if prof["email"] else ""
+        print(f"{prof['profile_directory']:<14} -> {prof['name']}{email_part}")
+    return 0
+
+
+def _cmd_fly(args: argparse.Namespace) -> int:
+    return fly_fleet(
+        Path(args.scene),
+        frames_spec=args.frames,
+        output_dir=Path(args.out),
+        accounts_spec=args.accounts,
+        gpu=args.gpu,
+        local_workers=args.local_workers,
+        local_device=args.local_device,
+        blender_bin=args.blender,
+        blender_version=args.blender_version,
+        public_url=args.public_url,
+        host=args.host,
+        port=args.port,
+        token=args.token,
+        engine=args.engine,
+        device=args.device,
+        samples=args.samples,
+        file_format=args.file_format,
+        prefix=args.prefix,
+        pad=args.pad,
+        lease_ttl=args.lease_ttl,
+        max_retries=args.max_retries,
+        poll_interval=args.poll_interval,
+        stitch_out=Path(args.stitch_out) if args.stitch_out else None,
+        fps=args.fps,
+        repo_url=args.repo_url,
+        high_mem=args.high_mem,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="blendfleet",
@@ -316,6 +437,106 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--token", default="")
     cl.set_defaults(func=_cmd_colab_launch)
 
+    # account
+    ac = sub.add_parser(
+        "account",
+        help="Manage login-once Google Colab accounts (isolated ADC credentials & sessions)",
+    )
+    ac_sub = ac.add_subparsers(dest="account_command", required=True)
+
+    ac_add = ac_sub.add_parser("add", help="Authenticate and save a Google Colab account once")
+    ac_add.add_argument("alias", help="Short local name for this account (e.g. 'studio1', 'triad')")
+    ac_add.add_argument(
+        "--chrome-profile",
+        default=None,
+        help="Optional Chrome profile directory (e.g. 'Profile 19') to open the OAuth login in",
+    )
+    ac_add.add_argument(
+        "--code",
+        default=None,
+        help="Authorization code for non-interactive / agent-driven OAuth completion",
+    )
+    ac_add.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Print the OAuth URL without launching a browser window",
+    )
+    ac_add.set_defaults(func=_cmd_account_add)
+
+    ac_list = ac_sub.add_parser("list", help="List saved Google Colab accounts")
+    ac_list.add_argument("--json", action="store_true", help="Emit JSON output")
+    ac_list.set_defaults(func=_cmd_account_list)
+
+    ac_check = ac_sub.add_parser(
+        "check",
+        help="Check live Colab identity and compute-unit (CCU) balance across saved accounts",
+    )
+    ac_check.add_argument(
+        "--accounts",
+        default="all",
+        help="Comma-separated account aliases or 'all' (default: all)",
+    )
+    ac_check.add_argument("--json", action="store_true", help="Emit JSON output")
+    ac_check.set_defaults(func=_cmd_account_check)
+
+    ac_rm = ac_sub.add_parser("remove", help="Delete saved credentials for an account alias")
+    ac_rm.add_argument("alias", help="Account alias to remove")
+    ac_rm.set_defaults(func=_cmd_account_remove)
+
+    ac_cp = ac_sub.add_parser(
+        "chrome-profiles",
+        help="List local Google Chrome profiles and their signed-in emails",
+    )
+    ac_cp.add_argument("--json", action="store_true", help="Emit JSON output")
+    ac_cp.set_defaults(func=_cmd_account_chrome_profiles)
+
+    # fly
+    fl = sub.add_parser(
+        "fly",
+        help="1-command headless multi-account Colab + local GPU render fleet launcher",
+    )
+    fl.add_argument("scene", help="Path to .blend or .zip project archive")
+    fl.add_argument("--frames", required=True, help="Frame spec, e.g. '1-240' or '1-10, 20, 35-55'")
+    fl.add_argument("--out", required=True, help="Directory to store verified rendered frames")
+    fl.add_argument(
+        "--accounts",
+        default="all",
+        help="Saved Colab account aliases: 'all', 'none', or comma-separated 'a,b' (default: all)",
+    )
+    fl.add_argument(
+        "--gpu",
+        default="T4",
+        choices=list(SUPPORTED_GPUS),
+        help="Colab accelerator tier (default: T4)",
+    )
+    fl.add_argument(
+        "--local-workers",
+        type=int,
+        default=0,
+        help="Also spawn N local persistent Blender workers alongside remote Colab GPUs",
+    )
+    fl.add_argument("--local-device", default=None, help="Device override for local workers")
+    fl.add_argument("--blender", default=None, help="Explicit path to local Blender binary")
+    fl.add_argument("--public-url", default=None, help="Existing public URL (skips cloudflared Quick Tunnel)")
+    fl.add_argument("--host", default="127.0.0.1")
+    fl.add_argument("--port", type=int, default=0)
+    fl.add_argument("--token", default=None, help="Shared bearer token (auto-generated if omitted)")
+    fl.add_argument("--stitch-out", default=None, help="Optional MP4 path to stitch automatically when complete")
+    fl.add_argument("--fps", type=float, default=24.0)
+    fl.add_argument("--engine", default="CYCLES", choices=["CYCLES", "EEVEE"])
+    fl.add_argument("--device", default="auto", choices=["auto", "optix", "cuda", "metal", "cpu"])
+    fl.add_argument("--samples", type=int, default=None)
+    fl.add_argument("--format", dest="file_format", default="PNG")
+    fl.add_argument("--prefix", default="frame_")
+    fl.add_argument("--pad", type=int, default=4)
+    fl.add_argument("--lease-ttl", type=float, default=300.0)
+    fl.add_argument("--max-retries", type=int, default=3)
+    fl.add_argument("--poll-interval", type=float, default=2.0)
+    fl.add_argument("--blender-version", default="5.2.3", help="Target Linux Blender version for Colab workers")
+    fl.add_argument("--high-mem", action="store_true", help="Request high-RAM Colab VMs (Pro/Pro+)")
+    fl.add_argument("--repo-url", default=DEFAULT_REPO_URL, help="Git URL installed inside Colab VMs")
+    fl.set_defaults(func=_cmd_fly)
+
     return p
 
 
@@ -327,6 +548,9 @@ def main(argv: list[str] | None = None) -> int:
     except subprocess.CalledProcessError as exc:
         print(f"[blendfleet] Command failed (exit {exc.returncode})", file=sys.stderr)
         return exc.returncode or 1
+    except (ValueError, FileNotFoundError, RuntimeError) as exc:
+        print(f"[blendfleet] Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

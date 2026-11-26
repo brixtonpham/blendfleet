@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "blendfleet"
-version = "0.1.0"
+version = "0.2.0"
 description = "Heterogeneous distributed Blender render farm for ephemeral Google Colab, Kaggle, and local GPUs."
 readme = "README.md"
 license = { text = "MIT" }
@@ -30,6 +30,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+colab = ["google-colab-cli>=0.8.0; python_version >= '3.12'"]
 mcp = ["websockets>=13.0"]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 

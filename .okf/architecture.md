@@ -38,6 +38,8 @@ sources:
 | `fs_queue.py` | Zero-server shared-storage queue using interleaved modulo priority + atomic `O_CREAT \| O_EXCL` lease files and stale-lease reclamation.[^src-fs-queue] |
 | `blender_worker.py` | Runs inside Blender's embedded Python (`blender -b scene.blend -P blender_worker.py`), loads `.blend` once, selects `OPTIX` / `CUDA` / `METAL` / `EEVEE` / `CPU`, and loops over frames.[^src-blender-worker] |
 | `worker.py` | Outer launcher that caches Linux Blender binaries (`download.blender.org` + `ftp.nluug.nl`), preloads `libtcmalloc_minimal`, and stages `.blend`/`.zip` onto local NVMe. |
+| `accounts.py` | Login-once multi-account credential store (`~/.config/blendfleet/accounts/<alias>/`, `0600` ADC JSON), Chrome profile discovery, and parallel `whoami` + CCU `usage` checks. |
+| `fleet.py` | 1-command headless fleet launcher (`blendfleet fly`) orchestrating coordinator, `cloudflared` tunnel, local workers, and parallel `google-colab-cli` GPU runtimes with automatic VM teardown. |
 | `colab_bridge.py` | Dual-stack (`127.0.0.1` + `::1`) port allocator for Colab MCP bridges, `bsk` multi-profile launcher, and Colab/Kaggle `.ipynb` generator.[^src-colab-bridge] |
 | `stitch.py` | Verifies frame completeness and stitches MP4s with `h264_videotoolbox`, `h264_nvenc`, or `libx264` (plus Linear EXR gamma). |
 
