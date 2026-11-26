@@ -1,0 +1,27 @@
+[tools]
+python = "3.12"
+uv = "latest"
+
+[tasks.setup]
+description = "Create virtualenv and install blendfleet in editable mode with dev extras"
+run = "uv sync --all-extras"
+
+[tasks.test]
+description = "Run unit and integration test suite"
+run = "uv run pytest -v"
+
+[tasks.lint]
+description = "Run ruff lint and format checks"
+run = "uv run ruff check src tests"
+
+[tasks.check]
+description = "Run lint, tests, and OKF validation"
+run = """
+uv run ruff check src tests
+uv run pytest -v
+uv run "$HOME/.gemini/config/skills/validate/scripts/okf_validate.py" .okf --strict
+"""
+
+[tasks.e2e-local]
+description = "Run a real multi-worker headless Blender render test using local Blender"
+run = "uv run python tests/e2e_blender_smoke.py"
