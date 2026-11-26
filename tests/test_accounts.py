@@ -186,7 +186,7 @@ def test_add_account_opens_macos_chrome_profile(
     monkeypatch.setattr(
         accounts,
         "exchange_auth_code",
-        lambda code: {"access_token": "tok", "refresh_token": "1//rf"},
+        lambda code, **kwargs: {"access_token": "tok", "refresh_token": "1//rf"},
     )
     monkeypatch.setattr(accounts, "fetch_userinfo", lambda token: {"email": "u@example.com"})
 

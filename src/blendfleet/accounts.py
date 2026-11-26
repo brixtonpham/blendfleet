@@ -8,10 +8,14 @@ session state file under ``~/.config/blendfleet/accounts/<alias>/``.
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
+import hashlib
+import http.server
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -105,37 +109,69 @@ def account_env(alias: str, *, accounts_dir: Path | None = None) -> dict[str, st
     }
 
 
-def build_auth_url(*, login_hint: str | None = None) -> str:
-    """Build Google's OAuth2 remote-code authorization URL for Colab ADC credentials."""
+def generate_pkce_pair() -> tuple[str, str]:
+    """Generate an RFC 7636 PKCE ``(code_verifier, code_challenge)`` pair (S256)."""
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _pending_pkce_path(alias: str, *, accounts_dir: Path | None = None) -> Path:
+    return account_dir(alias, accounts_dir=accounts_dir) / ".pending_pkce.json"
+
+
+def build_auth_url(
+    *,
+    redirect_uri: str = REDIRECT_URI,
+    code_challenge: str | None = None,
+    state: str | None = None,
+    login_hint: str | None = None,
+    token_usage: str | None = "remote",
+) -> str:
+    """Build Google's OAuth2 authorization URL with PKCE (S256) for Colab ADC credentials."""
     params: dict[str, str] = {
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
         "response_type": "code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": redirect_uri,
         "scope": " ".join(SCOPES),
         "access_type": "offline",
         "prompt": "consent",
-        "token_usage": "remote",
     }
+    if state:
+        params["state"] = state
+    if code_challenge:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = "S256"
+    if token_usage:
+        params["token_usage"] = token_usage
     if login_hint:
         params["login_hint"] = login_hint
     return f"{AUTH_URI}?{urllib.parse.urlencode(params)}"
 
 
-def exchange_auth_code(code: str, *, timeout: float = 30.0) -> dict[str, Any]:
-    """Exchange a pasted Google OAuth2 authorization code for tokens via stdlib HTTP."""
+def exchange_auth_code(
+    code: str,
+    *,
+    redirect_uri: str = REDIRECT_URI,
+    code_verifier: str | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Exchange a Google OAuth2 authorization code (with optional PKCE verifier) for tokens."""
     cleaned = code.strip()
     if not cleaned:
         raise ValueError("Authorization code cannot be empty.")
 
-    payload = urllib.parse.urlencode(
-        {
-            "code": cleaned,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "redirect_uri": REDIRECT_URI,
-            "grant_type": "authorization_code",
-        }
-    ).encode("utf-8")
+    form: dict[str, str] = {
+        "code": cleaned,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    }
+    if code_verifier:
+        form["code_verifier"] = code_verifier
+    payload = urllib.parse.urlencode(form).encode("utf-8")
 
     req = urllib.request.Request(
         TOKEN_URI,
@@ -238,6 +274,81 @@ def save_account_credentials(
     }
 
 
+def _run_loopback_oauth(
+    alias: str,
+    *,
+    chrome_profile: str | None = None,
+    timeout: float = 180.0,
+    print_fn: Callable[[str], None] = print,
+) -> tuple[str, str, str]:
+    """Run a 1-shot ``http://localhost:<port>/`` PKCE OAuth flow (zero manual copy-paste)."""
+    verifier, challenge = generate_pkce_pair()
+    expected_state = secrets.token_urlsafe(24)
+    captured: dict[str, str] = {}
+
+    class _CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            return
+
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(parsed.query)
+            if "error" in qs:
+                captured["error"] = qs["error"][0]
+                body = (
+                    b"<html><body style='font-family:system-ui;padding:40px'>"
+                    b"<h2>Authorization declined</h2><p>You may close this tab.</p>"
+                    b"</body></html>"
+                )
+                self.send_response(400)
+            elif "code" in qs:
+                captured["code"] = qs["code"][0]
+                captured["state"] = qs.get("state", [""])[0]
+                body = (
+                    "<html><body style='font-family:system-ui;padding:40px'>"
+                    "<h2>&#10003; blendfleet authorized!</h2>"
+                    f"<p>Account <b>{alias}</b> is connected. You can close this tab.</p>"
+                    "</body></html>"
+                ).encode()
+                self.send_response(200)
+            else:
+                self.send_response(204)
+                self.end_headers()
+                return
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+    httpd.timeout = timeout
+    port = int(httpd.server_address[1])
+    redirect_uri = f"http://localhost:{port}/"
+    auth_url = build_auth_url(
+        redirect_uri=redirect_uri,
+        code_challenge=challenge,
+        state=expected_state,
+        token_usage=None,
+    )
+
+    print_fn(f"Authorize Google Colab account '{alias}' (browser will redirect back automatically):\n\n  {auth_url}\n")
+    open_auth_url(auth_url, chrome_profile=chrome_profile)
+
+    try:
+        while "code" not in captured and "error" not in captured:
+            httpd.handle_request()
+            if not captured:
+                raise TimeoutError(f"Timed out after {int(timeout)}s waiting for OAuth callback.")
+    finally:
+        httpd.server_close()
+
+    if "error" in captured:
+        raise RuntimeError(f"Google OAuth returned error: {captured['error']}")
+    if captured.get("state") != expected_state:
+        raise RuntimeError("OAuth state mismatch; aborting authorization.")
+    return captured["code"], redirect_uri, verifier
+
+
 def add_account(
     alias: str,
     *,
@@ -248,24 +359,60 @@ def add_account(
     input_fn: Callable[[str], str] | None = None,
     print_fn: Callable[[str], None] = print,
 ) -> dict[str, Any]:
-    """Run the login-once OAuth2 flow and save ADC credentials for ``alias``.
+    """Run the login-once OAuth2 PKCE flow and save ADC credentials for ``alias``.
 
     Supports three modes:
-    - Interactive browser login (default or ``--chrome-profile``)
-    - Headless/agent 2-step flow: ``--no-browser`` without stdin prints the URL and exits,
-      then pass ``--code <auth_code>`` to complete non-interactively
-    - Headless interactive stdin: ``--no-browser`` in a TTY prints the URL and prompts for the code
+    - Interactive browser login (default or ``--chrome-profile``): uses a 1-shot
+      ``http://localhost:<port>/`` PKCE callback so the user only clicks **Allow**
+      (zero copy-paste required).
+    - Headless/agent 2-step flow: ``--no-browser`` saves a PKCE verifier, prints the
+      remote auth URL, and exits; pass ``--code <auth_code>`` to complete non-interactively.
+    - Custom ``input_fn`` (tests / TTY remote flow): prompts for the pasted code.
     """
     valid_alias = validate_alias(alias)
-    auth_url = build_auth_url()
-
     auth_code = code.strip() if code else ""
-    if not auth_code:
+    redirect_uri = REDIRECT_URI
+    code_verifier: str | None = None
+
+    if auth_code:
+        # Load saved PKCE verifier if created by a prior `--no-browser` step.
+        pkce_file = _pending_pkce_path(valid_alias, accounts_dir=accounts_dir)
+        if pkce_file.is_file():
+            try:
+                pending = json.loads(pkce_file.read_text(encoding="utf-8"))
+                code_verifier = pending.get("code_verifier")
+                redirect_uri = str(pending.get("redirect_uri") or REDIRECT_URI)
+            except (OSError, json.JSONDecodeError):
+                pass
+    elif not no_browser and input_fn is None:
+        auth_code, redirect_uri, code_verifier = _run_loopback_oauth(
+            valid_alias,
+            chrome_profile=chrome_profile,
+            print_fn=print_fn,
+        )
+    else:
+        code_verifier, challenge = generate_pkce_pair()
+        state = secrets.token_urlsafe(24)
+        auth_url = build_auth_url(
+            redirect_uri=REDIRECT_URI,
+            code_challenge=challenge,
+            state=state,
+            token_usage="remote",
+        )
         print_fn(f"Authorize Google Colab account '{valid_alias}' by opening:\n\n  {auth_url}\n")
         if not no_browser:
             open_auth_url(auth_url, chrome_profile=chrome_profile)
 
         if no_browser and input_fn is None and not sys.stdin.isatty():
+            acc_dir = account_dir(valid_alias, accounts_dir=accounts_dir)
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(acc_dir, 0o700)
+            pkce_file = _pending_pkce_path(valid_alias, accounts_dir=accounts_dir)
+            pkce_file.write_text(
+                json.dumps({"code_verifier": code_verifier, "redirect_uri": REDIRECT_URI}),
+                encoding="utf-8",
+            )
+            os.chmod(pkce_file, 0o600)
             print_fn(
                 f"After signing in, copy the authorization code and run:\n"
                 f"  blendfleet account add {valid_alias} --code <AUTH_CODE>"
@@ -281,7 +428,15 @@ def add_account(
         if not auth_code:
             raise ValueError("Authorization code cannot be empty.")
 
-    tokens = exchange_auth_code(auth_code)
+    tokens = exchange_auth_code(
+        auth_code,
+        redirect_uri=redirect_uri,
+        code_verifier=code_verifier,
+    )
+    pkce_file = _pending_pkce_path(valid_alias, accounts_dir=accounts_dir)
+    if pkce_file.exists():
+        pkce_file.unlink(missing_ok=True)
+
     email = ""
     access_token = tokens.get("access_token")
     if access_token:
