@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/brixtonpham/blendfleet/releases"><img src="https://img.shields.io/badge/version-v0.2.0-7c3aed?style=flat-square" alt="Version v0.2.0" /></a>
+  <a href="https://github.com/brixtonpham/blendfleet/releases"><img src="https://img.shields.io/badge/version-v0.3.0-7c3aed?style=flat-square" alt="Version v0.3.0" /></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-10b981?style=flat-square" alt="MIT License" /></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/core%20deps-0-14b8a6?style=flat-square" alt="Core Dependencies: 0" /></a>
@@ -91,8 +91,10 @@ blendfleet fly scene.blend \
 
 What `blendfleet fly` does automatically:
 1. Starts the local HTTP work-stealing coordinator, opens an isolated `cloudflared` Quick Tunnel (`--config /dev/null`, safe alongside existing Cloudflare tunnels) with an ephemeral bearer token, and verifies `/health` before provisioning any GPU.
-2. Spawns headless Colab GPU runtimes across every selected account (`--accounts all` or `--accounts acc1,acc2`) and attaches your local GPU (`--local-workers 1`).
-3. Streams `scene.blend` once per worker, keeps one persistent `bpy` process alive per GPU, reclaims frames if any Colab VM disconnects, validates PNG/EXR headers atomically, tears down Colab VMs cleanly on exit, and stitches `final.mp4` via hardware-accelerated FFmpeg.
+2. Spawns headless Colab GPU runtimes across every selected account (`--accounts all`, `--accounts acc1,acc2`, or mixed GPU tiers like `--accounts pro1:L4,free1:T4`) with staggered launch (`--stagger 1.5`) and attaches your local GPU (`--local-workers 1`).
+3. Pushes the running `blendfleet` worker bundle (~25 KB via `/worker-bundle.zip`, zero `pip install git+...` cold start), streams & SHA-256 verifies `scene.blend` once per worker, keeps one persistent `bpy` process alive per GPU with Cycles `use_persistent_data`, retries transient uploads, reclaims frames if any Colab VM disconnects, validates PNG/EXR headers atomically, tears down local + Colab workers cleanly on exit, and stitches `final.mp4` via hardware-accelerated FFmpeg.
+
+> Tip: If a session was ever hard-killed (`SIGKILL`) mid-allocation, run `blendfleet account clean-sessions` to release any orphaned server-side Colab GPU assignments immediately.
 
 ---
 

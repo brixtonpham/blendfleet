@@ -19,7 +19,9 @@ description = "Run lint, tests, and OKF validation"
 run = """
 uv run ruff check src tests
 uv run pytest -v
-uv run "$HOME/.gemini/config/skills/validate/scripts/okf_validate.py" .okf --strict
+if [ -f "$HOME/.gemini/config/skills/validate/scripts/okf_validate.py" ]; then
+  uv run "$HOME/.gemini/config/skills/validate/scripts/okf_validate.py" .okf --strict
+fi
 """
 
 [tasks.e2e-local]

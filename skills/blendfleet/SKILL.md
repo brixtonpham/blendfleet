@@ -102,9 +102,10 @@ blendfleet fly scene.blend \
 
 Key flags:
 - `--frames`: supports ranges, lists, and steps (e.g. `1-240`, `1-10, 20, 35-55`, `1-240:2`).
-- `--accounts`: `all` or comma-separated aliases (`acc1,acc2,acc3`).
-- `--samples`, `--engine CYCLES|EEVEE`, `--format PNG|OPEN_EXR`, `--blender-version 5.2.3`.
+- `--accounts`: `all`, comma-separated aliases (`acc1,acc2`), or mixed per-account GPU tiers (`pro1:L4,free1:T4,free2:T4`).
+- `--samples`, `--engine CYCLES|EEVEE`, `--format PNG|OPEN_EXR`, `--blender-version 5.2.3`, `--stagger 1.5`, `--drive-cache`, `--no-persistent-data`.
 - Re-running against the same `--out` directory automatically skips already-verified frames and renders only missing or corrupted ones.
+- If a prior run was hard-killed (`SIGKILL`) mid-allocation and Google returns `Allocation refused`, run `blendfleet account clean-sessions` to inspect/release orphaned server-side Colab runtimes.
 
 ### Fallback Modes
 

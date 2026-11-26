@@ -22,7 +22,7 @@ sources:
 
 # Decision
 
-Store each Google account as an isolated `0600` Authorized User JSON (`~/.config/blendfleet/accounts/<alias>/credentials.json`) minted via Google's official remote copy-paste OAuth2 flow without requiring `gcloud`, and drive headless Colab runtimes via `colab --auth=adc --config <sessions.json> run --timeout 0 --gpu <GPU>` with `GOOGLE_APPLICATION_CREDENTIALS` scoped per subprocess.[^accounts-py][^fleet-py]
+Store each Google account as an isolated `0600` Authorized User JSON (`~/.config/blendfleet/accounts/<alias>/credentials.json`) minted via pure-stdlib PKCE (`S256`) loopback OAuth (`http://localhost:<port>/`, with `--no-browser` + `--code` fallback) without requiring `gcloud`, and drive headless Colab runtimes via `colab --auth=adc --config <sessions.json> run --timeout 0 --gpu <GPU>` with `GOOGLE_APPLICATION_CREDENTIALS` scoped per subprocess. Workers fetch a ~25 KB `/worker-bundle.zip` directly from the coordinator (guaranteeing exact version parity without `pip install git+...`), and orphaned server-side Colab assignments can be listed and released via pure-stdlib `/tun/m/assignments` + `/tun/m/unassign` (`blendfleet account clean-sessions`).[^accounts-py][^fleet-py]
 
 # Rationale
 

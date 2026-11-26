@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/brixtonpham/blendfleet/releases"><img src="https://img.shields.io/badge/version-v0.2.0-7c3aed?style=flat-square" alt="Version v0.2.0" /></a>
+  <a href="https://github.com/brixtonpham/blendfleet/releases"><img src="https://img.shields.io/badge/version-v0.3.0-7c3aed?style=flat-square" alt="Version v0.3.0" /></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-10b981?style=flat-square" alt="MIT License" /></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/core%20deps-0-14b8a6?style=flat-square" alt="Core Dependencies: 0" /></a>
@@ -91,8 +91,10 @@ blendfleet fly scene.blend \
 
 `blendfleet fly` tự động thực hiện trọn gói:
 1. Mở HTTP coordinator chia tải trên máy cục bộ kèm `cloudflared` Quick Tunnel cô lập (`--config /dev/null`, không đụng với `~/.cloudflared/config.yml` sẵn có), bảo vệ bằng bearer token dùng một lần và kiểm tra `/health` thông suốt trước khi khởi tạo GPU.
-2. Khởi tạo runtime GPU Colab headless trên toàn bộ tài khoản đã chọn (`--accounts all` hoặc `--accounts acc1,acc2`) và gắn thêm GPU máy cục bộ (`--local-workers 1`).
-3. Truyền `scene.blend` đúng 1 lần cho mỗi worker, giữ một tiến trình `bpy` chạy liên tục trên mỗi GPU, tự thu hồi frame nếu một VM Colab ngắt kết nối, kiểm tra header PNG/EXR nguyên tử, tắt sạch VM Colab khi xong và ghép `final.mp4` bằng FFmpeg tăng tốc phần cứng.
+2. Khởi tạo runtime GPU Colab headless trên toàn bộ tài khoản đã chọn (`--accounts all`, `--accounts acc1,acc2` hoặc ghép nhiều hạng GPU như `--accounts pro1:L4,free1:T4`) với cơ chế giãn nhịp (`--stagger 1.5`) và gắn thêm GPU máy cục bộ (`--local-workers 1`).
+3. Đẩy gói worker `blendfleet` (~25 KB qua `/worker-bundle.zip`, không cần `pip install git+...`), truyền và kiểm tra SHA-256 `scene.blend` đúng 1 lần cho mỗi worker, giữ một tiến trình `bpy` chạy liên tục với Cycles `use_persistent_data`, tự thử lại khi upload chập chờn, thu hồi frame nếu một VM Colab ngắt kết nối, kiểm tra header PNG/EXR nguyên tử, tắt sạch worker cục bộ + VM Colab khi xong và ghép `final.mp4` bằng FFmpeg tăng tốc phần cứng.
+
+> Mẹo: Nếu phiên trước từng bị tắt đột ngột (`SIGKILL`) giữa chừng, chạy `blendfleet account clean-sessions` để giải phóng ngay các runtime Colab còn treo trên máy chủ Google.
 
 ---
 

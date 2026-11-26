@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/brixtonpham/blendfleet/releases"><img src="https://img.shields.io/badge/version-v0.2.0-7c3aed?style=flat-square" alt="Version v0.2.0" /></a>
+  <a href="https://github.com/brixtonpham/blendfleet/releases"><img src="https://img.shields.io/badge/version-v0.3.0-7c3aed?style=flat-square" alt="Version v0.3.0" /></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-10b981?style=flat-square" alt="MIT License" /></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/core%20deps-0-14b8a6?style=flat-square" alt="Core Dependencies: 0" /></a>
@@ -91,8 +91,10 @@ blendfleet fly scene.blend \
 
 `blendfleet fly` 会自动完成全部流程：
 1. 在本地启动 HTTP 工作窃取协调器，通过隔离模式（`--config /dev/null`，不干扰现有 `~/.cloudflared/config.yml`）打开带一次性 Bearer Token 的 `cloudflared` Quick Tunnel，并先确认 `/health` 可达再分配云端 GPU。
-2. 为每个选定账号（`--accounts all` 或 `--accounts acc1,acc2`）无头拉起 Colab GPU 实例，并同时挂载本地 GPU（`--local-workers 1`）。
-3. 每个节点仅传输一次 `scene.blend`，在单 GPU 上维持常驻 `bpy` 进程连续出帧；任意 Colab 实例断线时自动回收帧租约；写入前原子校验 PNG/EXR 文件头；结束后自动释放 Colab 实例并调用硬件加速 FFmpeg 合成 `final.mp4`。
+2. 为每个选定账号（`--accounts all`、`--accounts acc1,acc2` 或混合显卡规格 `--accounts pro1:L4,free1:T4`）错峰（`--stagger 1.5`）无头拉起 Colab GPU 实例，并同时挂载本地 GPU（`--local-workers 1`）。
+3. 直接从本地协调器推送 ~25 KB 的 `blendfleet` 工作包（`/worker-bundle.zip`，免 `pip install git+...` 冷启动），每个节点仅传输并 SHA-256 校验一次 `scene.blend`，启用 Cycles `use_persistent_data` 维持常驻 `bpy` 连续出帧；上传闪断自动重试，节点掉线自动回收帧租约，落盘前原子校验 PNG/EXR 文件头，结束后清理本地与云端实例并调用硬件加速 FFmpeg 合成 `final.mp4`。
+
+> 提示：如果历史任务曾被强制终止（`SIGKILL`）导致云端残留，运行 `blendfleet account clean-sessions` 即可一键释放孤立的 Colab 实例。
 
 ---
 
