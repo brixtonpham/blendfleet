@@ -11,9 +11,13 @@ import shutil
 import socket
 import subprocess
 import tarfile
+import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+
+from blendfleet import __version__
 
 BLENDER_MIRRORS: tuple[str, ...] = (
     "https://download.blender.org/release/Blender{major_minor}/blender-{version}-linux-x64.tar.xz",
@@ -136,11 +140,29 @@ def stage_scene_from_http(
 ) -> tuple[Path, dict]:
     """Fetch job metadata and cache the `.blend` (or `.zip`) asset locally on fast NVMe."""
     base = coordinator_url.rstrip("/")
-    headers = {"X-Blendfleet-Token": token}
+    headers = {
+        "X-Blendfleet-Token": token,
+        "User-Agent": f"blendfleet/{__version__}",
+    }
 
-    req = urllib.request.Request(f"{base}/job", headers=headers)
-    with urllib.request.urlopen(req, timeout=30.0) as resp:
-        job = json.loads(resp.read().decode("utf-8"))
+    job: dict | None = None
+    last_exc: Exception | None = None
+    for attempt in range(1, 7):
+        try:
+            req = urllib.request.Request(f"{base}/job", headers=headers)
+            with urllib.request.urlopen(req, timeout=30.0) as resp:
+                job = json.loads(resp.read().decode("utf-8"))
+                break
+        except (urllib.error.URLError, OSError) as exc:
+            last_exc = exc
+            if attempt < 6:
+                print(
+                    f"[blendfleet] Waiting for coordinator /job (attempt {attempt}/6: {exc})...",
+                    flush=True,
+                )
+                time.sleep(min(5.0, float(attempt)))
+    if job is None:
+        raise RuntimeError(f"Failed to fetch job metadata from {base}/job: {last_exc}") from last_exc
 
     work_dir.mkdir(parents=True, exist_ok=True)
     scene_name = job["scene_name"]

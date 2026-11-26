@@ -154,7 +154,10 @@ class HTTPQueueClient:
         self.host = socket.gethostname()
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
-        h = {"X-Blendfleet-Token": self.token}
+        h = {
+            "X-Blendfleet-Token": self.token,
+            "User-Agent": "blendfleet/0.2.0",
+        }
         if extra:
             h.update(extra)
         return h

@@ -17,6 +17,8 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -458,7 +460,7 @@ class QuickTunnel:
 
     URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 
-    def __init__(self, local_url: str, timeout: float = 25.0) -> None:
+    def __init__(self, local_url: str, timeout: float = 45.0) -> None:
         self.local_url = local_url
         self.timeout = timeout
         self.proc: subprocess.Popen[str] | None = None
@@ -479,6 +481,7 @@ class QuickTunnel:
         )
         deadline = time.time() + self.timeout
         assert self.proc.stdout is not None
+        found_url: str | None = None
         while time.time() < deadline:
             line = self.proc.stdout.readline()
             if not line:
@@ -487,10 +490,45 @@ class QuickTunnel:
                 continue
             match = self.URL_RE.search(line)
             if match:
-                self.public_url = match.group(0)
-                return self.public_url
+                found_url = match.group(0)
+                break
+
+        if not found_url:
+            self.stop()
+            raise TimeoutError("Timed out waiting for cloudflared Quick Tunnel URL.")
+
+        # Keep draining cloudflared output in the background so the pipe buffer never blocks it.
+        stream = self.proc.stdout
+
+        def _drain() -> None:
+            with contextlib.suppress(OSError, ValueError):
+                for _ in stream:
+                    pass
+
+        threading.Thread(target=_drain, name="cloudflared-drain", daemon=True).start()
+
+        # Wait until the public tunnel actually routes to our local coordinator /health endpoint.
+        health_url = f"{found_url}/health"
+        while time.time() < deadline:
+            try:
+                req = urllib.request.Request(
+                    health_url,
+                    headers={"User-Agent": f"blendfleet/{__version__}"},
+                )
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    if resp.status == 200:
+                        self.public_url = found_url
+                        return self.public_url
+            except (urllib.error.URLError, OSError):
+                pass
+            if self.proc.poll() is not None:
+                break
+            time.sleep(1.0)
+
         self.stop()
-        raise TimeoutError("Timed out waiting for cloudflared Quick Tunnel URL.")
+        raise TimeoutError(
+            f"cloudflared Quick Tunnel ({found_url}) did not become reachable at /health within {self.timeout:.0f}s."
+        )
 
     def stop(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
