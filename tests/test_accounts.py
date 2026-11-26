@@ -341,3 +341,132 @@ def test_cli_account_commands(
     rc_missing = cli.main(["account", "remove", "studio1"])
     assert rc_missing == 1
     assert os.environ.get("BLENDFLEET_ACCOUNTS_DIR") == str(root)
+
+
+def test_loopback_oauth_ignores_favicon_before_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+    import urllib.request
+
+    def fake_open(url: str, *, chrome_profile: str | None = None) -> None:
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        redirect_uri = qs["redirect_uri"][0]
+        state = qs["state"][0]
+
+        def _hit() -> None:
+            # First hit /favicon.ico (returns 204) — must NOT cause TimeoutError!
+            with urllib.request.urlopen(f"{redirect_uri}favicon.ico", timeout=5.0) as r1:
+                assert r1.status == 204
+            cb = f"{redirect_uri}?code=4/loopback-ok&state={urllib.parse.quote(state)}"
+            with urllib.request.urlopen(cb, timeout=5.0) as r2:
+                assert r2.status == 200
+
+        threading.Thread(target=_hit, daemon=True).start()
+
+    monkeypatch.setattr(accounts, "open_auth_url", fake_open)
+    code, redirect_uri, verifier = accounts._run_loopback_oauth(
+        "triad", timeout=10.0, print_fn=lambda _: None
+    )
+    assert code == "4/loopback-ok"
+    assert redirect_uri.startswith("http://localhost:")
+    assert len(verifier) >= 43
+
+
+def test_no_browser_two_step_pkce_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(accounts.sys, "stdin", io.StringIO(""))
+    step1 = accounts.add_account(
+        "agent-acc",
+        no_browser=True,
+        accounts_dir=tmp_path,
+        print_fn=lambda _: None,
+    )
+    assert step1["status"] == "awaiting_code"
+    pkce_file = tmp_path / "agent-acc" / ".pending_pkce.json"
+    assert pkce_file.is_file()
+    saved_verifier = json.loads(pkce_file.read_text(encoding="utf-8"))["code_verifier"]
+
+    seen_verifier: list[str | None] = []
+
+    def fake_exchange(
+        code: str, *, redirect_uri: str = accounts.REDIRECT_URI, code_verifier: str | None = None, timeout: float = 30.0
+    ) -> dict[str, Any]:
+        seen_verifier.append(code_verifier)
+        return {"access_token": "ya29.ok", "refresh_token": "1//rf-ok"}
+
+    monkeypatch.setattr(accounts, "exchange_auth_code", fake_exchange)
+    monkeypatch.setattr(accounts, "fetch_userinfo", lambda _: {"email": "agent@example.com"})
+
+    step2 = accounts.add_account(
+        "agent-acc",
+        code="4/code-step2",
+        accounts_dir=tmp_path,
+        print_fn=lambda _: None,
+    )
+    assert step2["status"] == "saved"
+    assert seen_verifier == [saved_verifier]
+    assert not pkce_file.exists()
+
+
+def test_parse_account_gpu_specs_mixed_tiers(tmp_path: Path) -> None:
+    for alias in ("pro1", "free1", "free2"):
+        accounts.save_account_credentials(alias, refresh_token=f"1//{alias}", accounts_dir=tmp_path)
+
+    supported = ("T4", "L4", "G4", "A100", "H100", "CPU")
+    parsed = accounts.parse_account_gpu_specs(
+        "pro1:L4, free1:t4, free2", "T4", supported, accounts_dir=tmp_path
+    )
+    assert parsed == [("pro1", "L4"), ("free1", "T4"), ("free2", "T4")]
+
+    with pytest.raises(ValueError, match="Unsupported GPU"):
+        accounts.parse_account_gpu_specs("pro1:RTX9090", "T4", supported, accounts_dir=tmp_path)
+
+
+def test_clean_account_sessions_unassigns_and_removes_stale_sessions_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    accounts.save_account_credentials("acc1", refresh_token="1//rf1", accounts_dir=tmp_path)
+    sess_file = accounts.sessions_path("acc1", accounts_dir=tmp_path)
+    sess_file.write_text('{"sessions": []}', encoding="utf-8")
+
+    requests_seen: list[tuple[str, str, str | None]] = []
+
+    class _RawResp:
+        def __init__(self, text: str) -> None:
+            self._raw = text.encode("utf-8")
+
+        def read(self) -> bytes:
+            return self._raw
+
+        def __enter__(self) -> _RawResp:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+    def fake_urlopen(req: Any, timeout: float = 20.0) -> _RawResp:
+        requests_seen.append((req.get_method(), req.full_url, req.get_header("X-goog-colab-token")))
+        if req.full_url == accounts.TOKEN_URI:
+            return _RawResp(json.dumps({"access_token": "ya29.fresh"}))
+        if "/tun/m/assignments" in req.full_url:
+            return _RawResp(")]}'\n" + json.dumps({"assignments": [{"endpoint": "gpu-t4-s-abc"}]}))
+        if "/tun/m/unassign/gpu-t4-s-abc" in req.full_url and req.get_method() == "GET":
+            return _RawResp(")]}'\n" + json.dumps({"token": "xsrf-123"}))
+        if "/tun/m/unassign/gpu-t4-s-abc" in req.full_url and req.get_method() == "POST":
+            return _RawResp(")]}'\n{}")
+        raise AssertionError(f"Unexpected request: {req.get_method()} {req.full_url}")
+
+    monkeypatch.setattr(accounts.urllib.request, "urlopen", fake_urlopen)
+
+    dry = accounts.clean_account_sessions("acc1", accounts_dir=tmp_path, dry_run=True)
+    assert dry["ok"] is True
+    assert dry["found"] == ["gpu-t4-s-abc"]
+    assert dry["unassigned"] == []
+    assert sess_file.is_file()
+
+    res = accounts.clean_account_sessions("acc1", accounts_dir=tmp_path, dry_run=False)
+    assert res["ok"] is True
+    assert res["unassigned"] == ["gpu-t4-s-abc"]
+    assert not sess_file.exists()
+    assert any(m == "POST" and tok == "xsrf-123" for m, _, tok in requests_seen)

@@ -6,8 +6,10 @@ atomic ``O_CREAT | O_EXCL`` lease files and stale-lease reclamation when a Colab
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import secrets
 import time
 from pathlib import Path
 
@@ -56,31 +58,66 @@ class SharedFSQueue:
         valid, _ = validate_image_file(self.frame_path(frame), ext=self.ext)
         return valid
 
-    def _is_lease_stale(self, lease_file: Path, now: float) -> bool:
+    def _read_lease_data(self, lease_file: Path) -> dict | None:
         try:
             data = json.loads(lease_file.read_text(encoding="utf-8"))
-            heartbeat = float(data.get("heartbeat_at", data.get("claimed_at", 0.0)))
-            ttl = float(data.get("lease_ttl", self.lease_ttl))
-            return (now - heartbeat) > ttl
+            return data if isinstance(data, dict) else None
         except (OSError, ValueError, TypeError):
+            return None
+
+    def _is_lease_stale(self, lease_file: Path, now: float) -> bool:
+        data = self._read_lease_data(lease_file)
+        if data is not None:
             try:
-                mtime = lease_file.stat().st_mtime
-            except OSError:
-                return False
-            return (now - mtime) > self.lease_ttl
+                heartbeat = float(data.get("heartbeat_at", data.get("claimed_at", 0.0)))
+                ttl = float(data.get("lease_ttl", self.lease_ttl))
+                return (now - heartbeat) > ttl
+            except (ValueError, TypeError):
+                pass
+        try:
+            mtime = lease_file.stat().st_mtime
+        except OSError:
+            return False
+        return (now - mtime) > self.lease_ttl
+
+    def _reclaim_stale_lease(self, lpath: Path, now: float) -> bool:
+        """Atomically quarantine and remove a stale lease without clobbering a newer owner."""
+        stale_data = self._read_lease_data(lpath)
+        stale_marker = stale_data.get("lease_id") if stale_data else None
+        quarantine = lpath.with_name(f".{lpath.name}.stale.{secrets.token_hex(4)}")
+        try:
+            os.rename(lpath, quarantine)
+        except OSError:
+            return False
+
+        # Verify the file we moved is still the stale lease (not a brand-new owner's lease).
+        moved_data = self._read_lease_data(quarantine)
+        moved_marker = moved_data.get("lease_id") if moved_data else None
+        if (
+            stale_marker is not None
+            and moved_marker is not None
+            and moved_marker != stale_marker
+            and not self._is_lease_stale(quarantine, now)
+        ):
+            # Restore the newer worker's lease if possible.
+            with contextlib.suppress(OSError):
+                os.rename(quarantine, lpath)
+            return False
+
+        with contextlib.suppress(OSError):
+            quarantine.unlink()
+        return True
 
     def _try_acquire_lease(self, frame: int, now: float) -> bool:
         lpath = self.lease_path(frame)
         if lpath.exists() and self._is_lease_stale(lpath, now):
-            try:
-                lpath.unlink()
-            except OSError:
-                return False
+            self._reclaim_stale_lease(lpath, now)
 
         payload = json.dumps(
             {
                 "frame": frame,
                 "worker_id": self.worker_id,
+                "lease_id": secrets.token_hex(8),
                 "claimed_at": now,
                 "heartbeat_at": now,
                 "lease_ttl": self.lease_ttl,
@@ -123,27 +160,38 @@ class SharedFSQueue:
 
         return None, (not saw_active_lease)
 
-    def heartbeat(self, frame: int) -> None:
-        """Refresh the heartbeat timestamp on an active lease."""
+    def heartbeat(self, frame: int) -> bool:
+        """Refresh the heartbeat timestamp if this worker still owns ``frame``'s lease."""
         lpath = self.lease_path(frame)
-        if not lpath.exists():
-            return
+        current = self._read_lease_data(lpath)
+        if current is None or current.get("worker_id") != self.worker_id:
+            return False
+
         now = time.time()
         payload = json.dumps(
             {
                 "frame": frame,
                 "worker_id": self.worker_id,
-                "claimed_at": now,
+                "lease_id": current.get("lease_id") or secrets.token_hex(8),
+                "claimed_at": current.get("claimed_at", now),
                 "heartbeat_at": now,
                 "lease_ttl": self.lease_ttl,
             }
         )
-        tmp = lpath.with_suffix(".lease.tmp")
+        tmp = lpath.with_name(f".{lpath.name}.{self.worker_id}.{secrets.token_hex(4)}.tmp")
         try:
             tmp.write_text(payload, encoding="utf-8")
+            # Re-verify ownership right before swap to minimize late-wakeup clobbering.
+            latest = self._read_lease_data(lpath)
+            if latest is None or latest.get("worker_id") != self.worker_id:
+                tmp.unlink(missing_ok=True)
+                return False
             os.replace(tmp, lpath)
+            return True
         except OSError:
-            pass
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            return False
 
     def complete_frame(self, frame: int, rendered_local_path: Path) -> Path:
         """Atomically publish a validated local frame into ``output_dir`` and clear its lease."""
@@ -152,7 +200,7 @@ class SharedFSQueue:
             raise ValueError(f"Refusing to publish invalid frame {frame}: {reason}")
 
         dest = self.frame_path(frame)
-        part = dest.with_name(f".{dest.name}.{self.worker_id}.part")
+        part = dest.with_name(f".{dest.name}.{self.worker_id}.{secrets.token_hex(4)}.part")
         part.write_bytes(rendered_local_path.read_bytes())
         os.replace(part, dest)
         self.release_lease(frame)

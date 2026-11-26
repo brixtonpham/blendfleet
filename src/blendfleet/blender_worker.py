@@ -30,8 +30,12 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR.parent) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR.parent))
 
+from blendfleet import __version__  # noqa: E402
 from blendfleet.frames import BLENDER_FORMAT_EXT, parse_frame_spec  # noqa: E402
 from blendfleet.fs_queue import SharedFSQueue  # noqa: E402
+
+MAX_CONSECUTIVE_CLAIM_ERRORS = 20
+UPLOAD_MAX_ATTEMPTS = 4
 
 
 def detect_gpu_label() -> str:
@@ -88,6 +92,7 @@ def configure_blender_scene(
     samples: int | None,
     file_format: str,
     use_cpu_with_gpu: bool = False,
+    persistent_data: bool = True,
 ) -> str:
     """Configure Blender's render engine, compute device, and output format once per worker."""
     import bpy  # type: ignore[import-not-found]
@@ -113,6 +118,8 @@ def configure_blender_scene(
         backend = pick_cycles_backend(device_pref, gpu_label)
         if samples is not None:
             scene.cycles.samples = samples
+        if hasattr(scene.render, "use_persistent_data"):
+            scene.render.use_persistent_data = bool(persistent_data)
 
         if backend == "CPU":
             scene.cycles.device = "CPU"
@@ -139,7 +146,12 @@ def configure_blender_scene(
 
     scene.render.image_settings.file_format = file_format.upper()
     scene.render.use_file_extension = True
-    print(f"[blendfleet] Configured engine={active_backend} format={file_format}", flush=True)
+    scene.render.use_overwrite = True
+    print(
+        f"[blendfleet] Configured engine={active_backend} format={file_format} "
+        f"persistent_data={persistent_data}",
+        flush=True,
+    )
     return active_backend
 
 
@@ -156,7 +168,7 @@ class HTTPQueueClient:
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         h = {
             "X-Blendfleet-Token": self.token,
-            "User-Agent": "blendfleet/0.2.0",
+            "User-Agent": f"blendfleet/{__version__}",
         }
         if extra:
             h.update(extra)
@@ -187,23 +199,57 @@ class HTTPQueueClient:
                 timeout=15.0,
             )
 
-    def upload_frame(self, frame: int, lease_id: str, path: Path, duration_sec: float) -> dict:
+    def upload_frame(
+        self,
+        frame: int,
+        lease_id: str,
+        path: Path,
+        duration_sec: float,
+        *,
+        max_attempts: int = UPLOAD_MAX_ATTEMPTS,
+        retry_backoff: float = 1.0,
+    ) -> dict:
+        """Upload a rendered frame with exponential retry on transient network/5xx errors."""
         data = path.read_bytes()
-        req = urllib.request.Request(
-            f"{self.base_url}/frames/{frame}",
-            data=data,
-            headers=self._headers(
-                {
-                    "Content-Type": "application/octet-stream",
-                    "X-Blendfleet-Worker": self.worker_id,
-                    "X-Blendfleet-Lease": lease_id,
-                    "X-Blendfleet-Duration": f"{duration_sec:.3f}",
-                }
-            ),
-            method="POST",
+        headers = self._headers(
+            {
+                "Content-Type": "application/octet-stream",
+                "X-Blendfleet-Worker": self.worker_id,
+                "X-Blendfleet-Lease": lease_id,
+                "X-Blendfleet-Duration": f"{duration_sec:.3f}",
+            }
         )
-        with urllib.request.urlopen(req, timeout=120.0) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        last_exc: Exception | None = None
+        attempts = max(1, int(max_attempts))
+        for attempt in range(1, attempts + 1):
+            req = urllib.request.Request(
+                f"{self.base_url}/frames/{frame}",
+                data=data,
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120.0) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                # Never retry 4xx client errors (400 corrupted image, 401 unauthorized, etc.).
+                if exc.code < 500:
+                    raise
+                last_exc = exc
+            except (urllib.error.URLError, OSError) as exc:
+                last_exc = exc
+
+            if attempt < attempts:
+                delay = retry_backoff * (2 ** (attempt - 1))
+                print(
+                    f"[blendfleet] Upload retry {attempt}/{attempts - 1} for frame {frame} "
+                    f"after error ({last_exc}); waiting {delay:.1f}s...",
+                    flush=True,
+                )
+                time.sleep(delay)
+
+        assert last_exc is not None
+        raise last_exc
 
     def report_failure(self, frame: int, lease_id: str, error: str) -> None:
         with contextlib.suppress(Exception):
@@ -251,14 +297,53 @@ def _scratch_base() -> Path:
 def run_http_loop(args: argparse.Namespace, gpu_label: str, ext: str) -> int:
     client = HTTPQueueClient(args.coordinator_url, args.token, args.worker_id, gpu_label)
     rendered = 0
+    consecutive_errors = 0
 
     with tempfile.TemporaryDirectory(prefix="blendfleet_frames_", dir=_scratch_base()) as tmp:
         scratch = Path(tmp)
         while True:
             try:
                 claim = client.claim()
-            except urllib.error.URLError as exc:
-                print(f"[blendfleet] Coordinator unreachable ({exc}); retrying in 5s...", flush=True)
+                consecutive_errors = 0
+            except urllib.error.HTTPError as exc:
+                if exc.code in (400, 401, 403, 404):
+                    print(
+                        f"[blendfleet] Fatal coordinator error HTTP {exc.code}; exiting worker.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return 2
+                consecutive_errors += 1
+                if consecutive_errors >= MAX_CONSECUTIVE_CLAIM_ERRORS:
+                    print(
+                        f"[blendfleet] Coordinator failed {consecutive_errors}x consecutively "
+                        f"(HTTP {exc.code}); exiting worker.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return 2
+                print(
+                    f"[blendfleet] Coordinator HTTP {exc.code} ({consecutive_errors}/{MAX_CONSECUTIVE_CLAIM_ERRORS}); "
+                    f"retrying in 5s...",
+                    flush=True,
+                )
+                time.sleep(5.0)
+                continue
+            except (urllib.error.URLError, OSError) as exc:
+                consecutive_errors += 1
+                if consecutive_errors >= MAX_CONSECUTIVE_CLAIM_ERRORS:
+                    print(
+                        f"[blendfleet] Coordinator unreachable {consecutive_errors}x consecutively "
+                        f"({exc}); exiting worker.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return 2
+                print(
+                    f"[blendfleet] Coordinator unreachable ({exc}) "
+                    f"({consecutive_errors}/{MAX_CONSECUTIVE_CLAIM_ERRORS}); retrying in 5s...",
+                    flush=True,
+                )
                 time.sleep(5.0)
                 continue
 
@@ -372,6 +457,7 @@ def parse_blender_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--samples", type=int, default=None)
     p.add_argument("--format", dest="file_format", default="PNG")
     p.add_argument("--use-cpu-with-gpu", action="store_true")
+    p.add_argument("--no-persistent-data", action="store_true")
 
     # HTTP mode args
     p.add_argument("--coordinator-url", default="")
@@ -390,15 +476,21 @@ def parse_blender_args(argv: list[str]) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_blender_args(sys.argv)
+    fmt = args.file_format.upper()
+    if fmt not in BLENDER_FORMAT_EXT:
+        supported = ", ".join(sorted(BLENDER_FORMAT_EXT))
+        raise ValueError(f"Unsupported file format {args.file_format!r}. Supported: {supported}.")
+
     gpu_label = detect_gpu_label()
-    ext = BLENDER_FORMAT_EXT.get(args.file_format.upper(), "png")
+    ext = BLENDER_FORMAT_EXT[fmt]
     configure_blender_scene(
         engine=args.engine,
         device_pref=args.device,
         gpu_label=gpu_label,
         samples=args.samples,
-        file_format=args.file_format,
+        file_format=fmt,
         use_cpu_with_gpu=args.use_cpu_with_gpu,
+        persistent_data=not args.no_persistent_data,
     )
     if args.mode == "http":
         return run_http_loop(args, gpu_label, ext)

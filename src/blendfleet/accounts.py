@@ -1,16 +1,18 @@
-"""Headless multi-account Google Colab credential and profile manager.
+"""Headless multi-account Google Colab credential, profile, and assignment manager.
 
-Implements Google's OAuth2 remote-code flow using 100% Python stdlib so users can
-authenticate multiple Google accounts once without installing ``gcloud`` CLI. Each
-account gets its own isolated ADC credentials file (``0o600``) and ``google-colab-cli``
-session state file under ``~/.config/blendfleet/accounts/<alias>/``.
+Implements Google's OAuth2 PKCE flow using 100% Python stdlib so users can authenticate
+multiple Google accounts once without installing ``gcloud`` CLI. Each account gets its own
+isolated ADC credentials file (``0o600``) and ``google-colab-cli`` session state file under
+``~/.config/blendfleet/accounts/<alias>/``.
 """
 
 from __future__ import annotations
 
 import base64
 import concurrent.futures
+import contextlib
 import hashlib
+import html
 import http.server
 import json
 import os
@@ -19,6 +21,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,6 +38,9 @@ AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 USERINFO_URI = "https://www.googleapis.com/oauth2/v2/userinfo"
 REDIRECT_URI = "https://sdk.cloud.google.com/applicationdefaultauthcode.html"
+COLAB_DOMAIN = "https://colab.research.google.com"
+COLAB_TUN_ENDPOINT = "/tun/m"
+COLAB_XSSI_PREFIX = ")]}'\n"
 SCOPES: tuple[str, ...] = (
     "openid",
     "https://www.googleapis.com/auth/userinfo.profile",
@@ -55,6 +61,24 @@ _CCU_RE = re.compile(
     r"(?:balance|available|remaining|compute\s*units?|ccu)\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)",
     re.IGNORECASE,
 )
+
+
+def default_chrome_local_state() -> Path:
+    """Return the platform-appropriate default Google Chrome ``Local State`` path."""
+    if sys.platform == "darwin":
+        return DEFAULT_CHROME_LOCAL_STATE
+    if sys.platform == "win32":
+        local_app = os.environ.get("LOCALAPPDATA")
+        if local_app:
+            return Path(local_app) / "Google" / "Chrome" / "User Data" / "Local State"
+        return Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data" / "Local State"
+    for cand in (
+        Path.home() / ".config" / "google-chrome" / "Local State",
+        Path.home() / ".config" / "chromium" / "Local State",
+    ):
+        if cand.is_file():
+            return cand
+    return Path.home() / ".config" / "google-chrome" / "Local State"
 
 
 def accounts_root(accounts_dir: Path | None = None) -> Path:
@@ -193,6 +217,205 @@ def exchange_auth_code(
     return data
 
 
+def refresh_access_token(
+    alias: str,
+    *,
+    accounts_dir: Path | None = None,
+    timeout: float = 20.0,
+) -> str:
+    """Exchange a saved account's ADC refresh token for a fresh OAuth2 access token."""
+    creds_file = credentials_path(alias, accounts_dir=accounts_dir)
+    if not creds_file.is_file():
+        raise FileNotFoundError(f"Credentials file not found for account {alias!r}: {creds_file}")
+    creds = json.loads(creds_file.read_text(encoding="utf-8"))
+    form = {
+        "client_id": str(creds.get("client_id") or CLIENT_ID),
+        "client_secret": str(creds.get("client_secret") or CLIENT_SECRET),
+        "refresh_token": str(creds["refresh_token"]),
+        "grant_type": "refresh_token",
+    }
+    req = urllib.request.Request(
+        TOKEN_URI,
+        data=urllib.parse.urlencode(form).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Failed to refresh OAuth token for {alias!r} (HTTP {exc.code}): {body}") from exc
+    token = str(data.get("access_token") or "")
+    if not token:
+        raise RuntimeError(f"Google OAuth refresh returned no access_token for {alias!r}.")
+    return token
+
+
+def _colab_tun_request(
+    path: str,
+    access_token: str,
+    *,
+    method: str = "GET",
+    extra_headers: dict[str, str] | None = None,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """Call a Google Colab `/tun/m/...` backend endpoint using Python stdlib."""
+    url = f"{COLAB_DOMAIN}{COLAB_TUN_ENDPOINT}/{path.lstrip('/')}?authuser=0"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "X-Colab-Client-Agent": "colab-cli",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    data = b"" if method == "POST" else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Colab backend {method} {path} failed (HTTP {exc.code}): {body}") from exc
+
+    if raw.startswith(COLAB_XSSI_PREFIX):
+        raw = raw[len(COLAB_XSSI_PREFIX) :]
+    raw = raw.strip()
+    if not raw:
+        return {}
+    parsed = json.loads(raw)
+    return parsed if isinstance(parsed, dict) else {"data": parsed}
+
+
+def list_remote_assignments(
+    alias: str,
+    *,
+    accounts_dir: Path | None = None,
+    access_token: str | None = None,
+    timeout: float = 20.0,
+) -> list[dict[str, Any]]:
+    """List active server-side Google Colab runtime assignments for ``alias``."""
+    token = access_token or refresh_access_token(alias, accounts_dir=accounts_dir, timeout=timeout)
+    payload = _colab_tun_request("assignments", token, method="GET", timeout=timeout)
+    assignments = payload.get("assignments")
+    if not isinstance(assignments, list):
+        return []
+    return [item for item in assignments if isinstance(item, dict)]
+
+
+def unassign_remote_endpoint(
+    alias: str,
+    endpoint: str,
+    *,
+    accounts_dir: Path | None = None,
+    access_token: str | None = None,
+    timeout: float = 20.0,
+) -> None:
+    """Terminate an active server-side Colab runtime assignment by endpoint ID."""
+    token = access_token or refresh_access_token(alias, accounts_dir=accounts_dir, timeout=timeout)
+    clean_ep = endpoint.strip().lstrip("/")
+    xsrf_payload = _colab_tun_request(f"unassign/{clean_ep}", token, method="GET", timeout=timeout)
+    xsrf_token = str(xsrf_payload.get("token") or "")
+    if not xsrf_token:
+        raise RuntimeError(f"Colab did not return XSRF token to unassign {clean_ep!r}.")
+    _colab_tun_request(
+        f"unassign/{clean_ep}",
+        token,
+        method="POST",
+        extra_headers={"X-Goog-Colab-Token": xsrf_token},
+        timeout=timeout,
+    )
+
+
+def clean_account_sessions(
+    alias: str,
+    *,
+    accounts_dir: Path | None = None,
+    dry_run: bool = False,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """Discover and release orphaned server-side Colab runtime assignments for ``alias``."""
+    valid_alias = validate_alias(alias)
+    try:
+        token = refresh_access_token(valid_alias, accounts_dir=accounts_dir, timeout=timeout)
+        assignments = list_remote_assignments(
+            valid_alias,
+            accounts_dir=accounts_dir,
+            access_token=token,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        return {
+            "alias": valid_alias,
+            "ok": False,
+            "found": [],
+            "unassigned": [],
+            "error": str(exc),
+        }
+
+    endpoints = [str(item.get("endpoint") or "") for item in assignments if item.get("endpoint")]
+    unassigned: list[str] = []
+    errors: list[str] = []
+    if not dry_run:
+        for ep in endpoints:
+            try:
+                unassign_remote_endpoint(
+                    valid_alias,
+                    ep,
+                    accounts_dir=accounts_dir,
+                    access_token=token,
+                    timeout=timeout,
+                )
+                unassigned.append(ep)
+            except Exception as exc:
+                errors.append(f"{ep}: {exc}")
+        # Clear stale local sessions.json after unassigning remote runtimes.
+        sess = sessions_path(valid_alias, accounts_dir=accounts_dir)
+        if not errors and sess.is_file():
+            with contextlib.suppress(OSError):
+                sess.unlink()
+
+    return {
+        "alias": valid_alias,
+        "ok": len(errors) == 0,
+        "found": endpoints,
+        "unassigned": unassigned,
+        "dry_run": dry_run,
+        "error": "; ".join(errors) if errors else None,
+    }
+
+
+def clean_all_account_sessions(
+    aliases: list[str] | None = None,
+    *,
+    accounts_dir: Path | None = None,
+    dry_run: bool = False,
+    max_workers: int = 8,
+    timeout: float = 20.0,
+) -> list[dict[str, Any]]:
+    """Discover and release orphaned Colab runtime assignments across accounts in parallel."""
+    target_aliases = (
+        list(aliases)
+        if aliases is not None
+        else [row["alias"] for row in list_accounts(accounts_dir=accounts_dir)]
+    )
+    if not target_aliases:
+        return []
+    pool_size = max(1, min(max_workers, len(target_aliases)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as pool:
+        futures = [
+            pool.submit(
+                clean_account_sessions,
+                alias,
+                accounts_dir=accounts_dir,
+                dry_run=dry_run,
+                timeout=timeout,
+            )
+            for alias in target_aliases
+        ]
+        return [fut.result() for fut in futures]
+
+
 def fetch_userinfo(access_token: str, *, timeout: float = 15.0) -> dict[str, Any]:
     """Fetch the authenticated Google user's profile/email using an access token."""
     req = urllib.request.Request(
@@ -209,7 +432,7 @@ def fetch_userinfo(access_token: str, *, timeout: float = 15.0) -> dict[str, Any
 
 
 def open_auth_url(url: str, *, chrome_profile: str | None = None) -> None:
-    """Open the OAuth URL in a specific Chrome profile (macOS/Linux) or default browser."""
+    """Open the OAuth URL in a specific Chrome profile (macOS/Linux/Windows) or default browser."""
     if chrome_profile:
         if sys.platform == "darwin":
             subprocess.Popen(
@@ -223,6 +446,14 @@ def open_auth_url(url: str, *, chrome_profile: str | None = None) -> None:
                 ]
             )
             return
+        if sys.platform == "win32":
+            chrome_win = (
+                shutil.which("chrome")
+                or str(Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Google/Chrome/Application/chrome.exe")
+            )
+            if Path(chrome_win).is_file():
+                subprocess.Popen([chrome_win, f"--profile-directory={chrome_profile}", url])
+                return
         chrome_bin = shutil.which("google-chrome") or shutil.which("chromium")
         if chrome_bin:
             subprocess.Popen([chrome_bin, f"--profile-directory={chrome_profile}", url])
@@ -285,6 +516,7 @@ def _run_loopback_oauth(
     verifier, challenge = generate_pkce_pair()
     expected_state = secrets.token_urlsafe(24)
     captured: dict[str, str] = {}
+    safe_alias = html.escape(alias)
 
     class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
@@ -307,11 +539,12 @@ def _run_loopback_oauth(
                 body = (
                     "<html><body style='font-family:system-ui;padding:40px'>"
                     "<h2>&#10003; blendfleet authorized!</h2>"
-                    f"<p>Account <b>{alias}</b> is connected. You can close this tab.</p>"
+                    f"<p>Account <b>{safe_alias}</b> is connected. You can close this tab.</p>"
                     "</body></html>"
                 ).encode()
                 self.send_response(200)
             else:
+                # Ignore auxiliary browser requests such as /favicon.ico without aborting.
                 self.send_response(204)
                 self.end_headers()
                 return
@@ -321,7 +554,6 @@ def _run_loopback_oauth(
             self.wfile.write(body)
 
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _CallbackHandler)
-    httpd.timeout = timeout
     port = int(httpd.server_address[1])
     redirect_uri = f"http://localhost:{port}/"
     auth_url = build_auth_url(
@@ -331,14 +563,20 @@ def _run_loopback_oauth(
         token_usage=None,
     )
 
-    print_fn(f"Authorize Google Colab account '{alias}' (browser will redirect back automatically):\n\n  {auth_url}\n")
+    print_fn(
+        f"Authorize Google Colab account '{alias}' (browser will redirect back automatically):\n\n"
+        f"  {auth_url}\n"
+    )
     open_auth_url(auth_url, chrome_profile=chrome_profile)
 
+    deadline = time.monotonic() + timeout
     try:
         while "code" not in captured and "error" not in captured:
-            httpd.handle_request()
-            if not captured:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise TimeoutError(f"Timed out after {int(timeout)}s waiting for OAuth callback.")
+            httpd.timeout = min(remaining, 1.0)
+            httpd.handle_request()
     finally:
         httpd.server_close()
 
@@ -524,6 +762,62 @@ def resolve_accounts(spec: str, *, accounts_dir: Path | None = None) -> list[str
     return aliases
 
 
+def parse_account_gpu_specs(
+    spec: str,
+    default_gpu: str,
+    supported_gpus: tuple[str, ...],
+    *,
+    accounts_dir: Path | None = None,
+) -> list[tuple[str, str]]:
+    """Resolve ``--accounts`` with optional per-account GPU overrides (e.g. ``pro1:L4,free1:T4``)."""
+    default_upper = default_gpu.strip().upper()
+    if default_upper not in supported_gpus:
+        raise ValueError(
+            f"Unsupported GPU {default_gpu!r}. Expected one of: {', '.join(supported_gpus)}."
+        )
+
+    cleaned = spec.strip()
+    if not cleaned or cleaned.lower() == "none":
+        return []
+    if cleaned.lower() == "all":
+        return [
+            (row["alias"], default_upper) for row in list_accounts(accounts_dir=accounts_dir)
+        ]
+
+    resolved: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    missing: list[str] = []
+    for raw in cleaned.split(","):
+        part = raw.strip()
+        if not part:
+            continue
+        if ":" in part:
+            raw_alias, raw_gpu = part.split(":", 1)
+            alias = validate_alias(raw_alias)
+            gpu = raw_gpu.strip().upper()
+            if gpu not in supported_gpus:
+                raise ValueError(
+                    f"Unsupported GPU {raw_gpu!r} for account {alias!r}. "
+                    f"Expected one of: {', '.join(supported_gpus)}."
+                )
+        else:
+            alias = validate_alias(part)
+            gpu = default_upper
+        if alias not in seen:
+            seen.add(alias)
+            resolved.append((alias, gpu))
+        if not credentials_path(alias, accounts_dir=accounts_dir).is_file():
+            missing.append(alias)
+
+    if missing:
+        joined = ", ".join(missing)
+        raise FileNotFoundError(
+            f"Unknown blendfleet account(s): {joined}. Run `blendfleet account list` or "
+            f"`blendfleet account add <alias>` first."
+        )
+    return resolved
+
+
 def _profile_sort_key(profile_dir: str) -> tuple[int, int, str]:
     if profile_dir == "Default":
         return (0, 0, profile_dir)
@@ -535,7 +829,9 @@ def _profile_sort_key(profile_dir: str) -> tuple[int, int, str]:
 
 def list_chrome_profiles(local_state_path: Path | None = None) -> list[dict[str, str]]:
     """List local Google Chrome profiles from ``Local State`` (``profile.info_cache``)."""
-    state_file = Path(local_state_path).expanduser() if local_state_path else DEFAULT_CHROME_LOCAL_STATE
+    state_file = (
+        Path(local_state_path).expanduser() if local_state_path else default_chrome_local_state()
+    )
     if not state_file.is_file():
         return []
 

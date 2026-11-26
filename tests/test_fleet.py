@@ -29,6 +29,7 @@ def test_build_colab_runner_script_compiles_and_contains_bootstrap() -> None:
     )
     compile(script, "<colab_runner>", "exec")
     assert "libtcmalloc-minimal4" in script
+    assert "/worker-bundle.zip" in script
     assert "git+{REPO_URL}" in script
     assert "https://github.com/brixtonpham/blendfleet.git" in script
     assert "https://demo.trycloudflare.com" in script
@@ -176,9 +177,10 @@ def test_fly_fleet_end_to_end_parallel_colab_accounts(
         scene,
         frames_spec="1-6",
         output_dir=out_dir,
-        accounts_spec="all",
+        accounts_spec="acc1:L4,acc2:T4",
         gpu="T4",
         poll_interval=0.05,
+        stagger=0.0,
         accounts_dir=acc_root,
         tmp_dir=fleet_tmp,
         colab_bin=str(fake_colab),
@@ -192,17 +194,18 @@ def test_fly_fleet_end_to_end_parallel_colab_accounts(
     # Temp runner directory must be cleaned up after completion.
     assert list(fleet_tmp.iterdir()) == []
 
-    # Verify both accounts ran with isolated credentials and sessions.json.
+    # Verify both accounts ran with isolated credentials, sessions.json, and mixed GPU tiers.
     invocations = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
     assert len(invocations) == 2
     by_gac = {Path(inv["gac"]).parent.name: inv for inv in invocations}
     assert set(by_gac.keys()) == {"acc1", "acc2"}
+    expected_gpus = {"acc1": "L4", "acc2": "T4"}
     for alias, inv in by_gac.items():
         assert inv["args"][0] == "--auth=adc"
         assert inv["args"][1] == "--config"
         assert inv["args"][2] == str(acc_root / alias / "sessions.json")
         assert inv["colab_config"] == str(acc_root / alias / "sessions.json")
-        assert "--gpu" in inv["args"] and "T4" in inv["args"]
+        assert "--gpu" in inv["args"] and expected_gpus[alias] in inv["args"]
         assert str(fleet_tmp) in inv["args"][-1]
 
     out = capsys.readouterr().out
@@ -386,3 +389,76 @@ def test_cli_fly_and_account_parser_flags() -> None:
     cp_args = parser.parse_args(["account", "chrome-profiles", "--json"])
     assert cp_args.account_command == "chrome-profiles"
     assert cp_args.json is True
+
+    clean_args = parser.parse_args(["account", "clean-sessions", "--accounts", "triad", "--dry-run", "--json"])
+    assert clean_args.account_command == "clean-sessions"
+    assert clean_args.accounts == "triad"
+    assert clean_args.dry_run is True
+    assert clean_args.json is True
+
+
+def test_fly_fleet_exits_fast_when_all_workers_die_holding_lease(
+    tmp_path: Path,
+) -> None:
+    acc_root = tmp_path / "accounts"
+    accounts.save_account_credentials("acc1", refresh_token="1//rf1", accounts_dir=acc_root)
+
+    scene = tmp_path / "demo.blend"
+    scene.write_bytes(b"BLENDER-v502dummy")
+    src_root = Path(__file__).resolve().parents[1] / "src"
+
+    # Worker claims frame 1 then crashes immediately (leaving an active 300s lease).
+    crasher = tmp_path / "fake_colab_crasher"
+    crasher.write_text(
+        f"""#!{sys.executable}
+import re, sys
+from pathlib import Path
+sys.path.insert(0, {str(src_root)!r})
+from blendfleet.blender_worker import HTTPQueueClient
+args = sys.argv[1:]
+if "stop" in args:
+    sys.exit(0)
+text = Path(args[-1]).read_text(encoding="utf-8")
+coord_url = re.search(r"COORDINATOR_URL = '([^']+)'", text).group(1)
+token = re.search(r"TOKEN = '([^']+)'", text).group(1)
+client = HTTPQueueClient(coord_url, token, "colab-acc1", "Tesla T4")
+client.claim()
+sys.exit(1)
+""",
+        encoding="utf-8",
+    )
+    os.chmod(crasher, stat.S_IRWXU)
+
+    t0 = time.monotonic()
+    orig_tunnel = fleet.QuickTunnel
+
+    class _LocalTunnel:
+        def __init__(self, local_url: str, timeout: float = 10.0) -> None:
+            self.local_url = local_url
+
+        def start(self) -> str:
+            return self.local_url
+
+        def stop(self) -> None:
+            return None
+
+    fleet.QuickTunnel = _LocalTunnel  # type: ignore[misc]
+    try:
+        rc = fleet.fly_fleet(
+            scene,
+            frames_spec="1-2",
+            output_dir=tmp_path / "out",
+            accounts_spec="acc1",
+            lease_ttl=300.0,
+            poll_interval=0.05,
+            stagger=0.0,
+            accounts_dir=acc_root,
+            tmp_dir=tmp_path / "tmp",
+            colab_bin=str(crasher),
+        )
+    finally:
+        fleet.QuickTunnel = orig_tunnel  # type: ignore[misc]
+
+    elapsed = time.monotonic() - t0
+    assert rc == 2
+    assert elapsed < 5.0

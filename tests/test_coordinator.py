@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -118,3 +119,85 @@ def test_colab_bridge_helpers() -> None:
     assert nb["nbformat"] == 4
     assert len(nb["cells"]) == 4
     assert "abc123" in json.dumps(nb)
+
+
+def test_coordinator_worker_bundle_and_input_validation(tmp_path: Path) -> None:
+    import io
+    import zipfile
+
+    scene = tmp_path / "demo.blend"
+    scene.write_bytes(b"BLENDER_DATA")
+
+    with pytest.raises(ValueError, match="Unsupported file format"):
+        JobState(scene, tmp_path / "out", [1], file_format="TIFF")
+
+    state = JobState(scene, tmp_path / "out", [1, 2], token="tok")
+    with CoordinatorServer(state, host="127.0.0.1", port=0) as srv:
+        req = urllib.request.Request(
+            f"{srv.url}/worker-bundle.zip", headers={"X-Blendfleet-Token": "tok"}
+        )
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            assert resp.status == 200
+            raw = resp.read()
+        with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+            names = set(zf.namelist())
+        assert "blendfleet/cli.py" in names
+        assert "blendfleet/worker.py" in names
+        assert "blendfleet/blender_worker.py" in names
+
+        # Unknown frame number must be rejected (400) and never inflate completed count.
+        w = HTTPQueueClient(srv.url, "tok", "w1", "T4")
+        tmp_png = tmp_path / "f.png"
+        tmp_png.write_bytes(VALID_PNG)
+        with pytest.raises(urllib.error.HTTPError) as exc_unknown:
+            w.upload_frame(999, "fake", tmp_png, duration_sec=0.1, max_attempts=1)
+        assert exc_unknown.value.code == 400
+        assert state.status()["completed"] == 0
+
+        # Malformed JSON on /heartbeat returns 400 cleanly instead of crashing.
+        bad_req = urllib.request.Request(
+            f"{srv.url}/heartbeat",
+            data=b"{not-json",
+            headers={"X-Blendfleet-Token": "tok", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_json:
+            urllib.request.urlopen(bad_req, timeout=5.0)
+        assert exc_json.value.code == 400
+
+
+def test_upload_frame_retries_transient_502(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    from blendfleet import blender_worker
+
+    png = tmp_path / "f1.png"
+    png.write_bytes(VALID_PNG)
+    attempts = 0
+
+    class _OkResp:
+        def read(self) -> bytes:
+            return b'{"ok": true, "reason": "ok"}'
+
+        def __enter__(self) -> _OkResp:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+    def fake_urlopen(req: Any, timeout: float = 120.0) -> _OkResp:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", {}, io.BytesIO(b""))
+        return _OkResp()
+
+    monkeypatch.setattr(blender_worker.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(blender_worker.time, "sleep", lambda _: None)
+
+    client = HTTPQueueClient("https://coord.example", "tok", "w1", "T4")
+    res = client.upload_frame(1, "lease1", png, duration_sec=1.5, max_attempts=3, retry_backoff=0.01)
+    assert res["ok"] is True
+    assert attempts == 2

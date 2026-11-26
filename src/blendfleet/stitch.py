@@ -27,7 +27,7 @@ def detect_video_encoder(preferred: str = "auto") -> tuple[str, list[str]]:
             encoders_out = ""
 
     if platform.system() == "Darwin" and "h264_videotoolbox" in encoders_out:
-        return "h264_videotoolbox", ["-b:v", "12M"]
+        return "h264_videotoolbox", ["-q:v", "65"]
 
     if platform.system() == "Linux" and shutil.which("nvidia-smi") and "h264_nvenc" in encoders_out:
         return "h264_nvenc", ["-preset", "p5", "-cq", "18"]
@@ -98,6 +98,9 @@ def stitch_frames(
                 str(concat_path),
                 "-r",
                 str(fps),
+                # Ensure even dimensions so yuv420p never fails on odd-resolution renders.
+                "-vf",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2",
                 "-c:v",
                 vcodec,
                 *codec_flags,

@@ -6,7 +6,6 @@ import argparse
 import json
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -14,6 +13,7 @@ from blendfleet import __version__
 from blendfleet.accounts import (
     add_account,
     check_all_accounts,
+    clean_all_account_sessions,
     list_accounts,
     list_chrome_profiles,
     remove_account,
@@ -24,11 +24,11 @@ from blendfleet.colab_bridge import (
     launch_colab_profiles,
     write_worker_notebook,
 )
-from blendfleet.coordinator import CoordinatorServer, JobState, QuickTunnel
+from blendfleet.coordinator import CoordinatorServer, JobState, QuickTunnel, format_progress
 from blendfleet.fleet import DEFAULT_REPO_URL, SUPPORTED_GPUS, fly_fleet
 from blendfleet.frames import BLENDER_FORMAT_EXT, parse_frame_spec, verify_frame_sequence
 from blendfleet.stitch import stitch_frames
-from blendfleet.worker import run_worker
+from blendfleet.worker import LocalWorkerHandle, run_worker
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -49,7 +49,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     )
 
     tunnel: QuickTunnel | None = None
-    local_threads: list[threading.Thread] = []
+    local_handles: list[LocalWorkerHandle] = []
 
     with CoordinatorServer(state, host=args.host, port=args.port) as server:
         connect_url = server.url
@@ -60,7 +60,10 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         try:
             print(f"blendfleet v{__version__} coordinator live", flush=True)
             print(f"  Scene       : {state.scene_path.name} ({state.scene_size:,} bytes)", flush=True)
-            print(f"  Frames      : {len(frames)} ({frames[0]}..{frames[-1]}), already done={len(state.completed)}", flush=True)
+            print(
+                f"  Frames      : {len(frames)} ({frames[0]}..{frames[-1]}), already done={len(state.completed)}",
+                flush=True,
+            )
             print(f"  Output dir  : {state.output_dir}", flush=True)
             print(f"  Local URL   : {server.url}", flush=True)
             if tunnel:
@@ -78,35 +81,24 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             )
 
             for i in range(args.local_workers):
-                t = threading.Thread(
-                    target=run_worker,
+                lh = LocalWorkerHandle(
+                    worker_id=f"local-{i}",
                     kwargs={
                         "mode": "http",
-                        "worker_id": f"local-{i}",
                         "blender_bin": args.blender,
                         "coordinator_url": server.url,
                         "token": state.token,
                         "device": args.local_device or args.device,
+                        "no_persistent_data": args.no_persistent_data,
                     },
-                    daemon=True,
                 )
-                t.start()
-                local_threads.append(t)
+                lh.start()
+                local_handles.append(lh)
 
             last_line = ""
             while True:
                 st = state.status()
-                workers_summary = ", ".join(
-                    f"{w['worker_id']}({w['gpu']}:{w['frames_completed']})"
-                    for w in st["workers"]
-                )
-                eta = f"ETA {st['eta_sec']}s" if st["eta_sec"] is not None else "ETA --"
-                line = (
-                    f"[progress] {st['completed']}/{st['total']} done | "
-                    f"active={st['in_progress']} pending={st['pending']} "
-                    f"reclaimed={st['reclaimed']} failed={st['failed']} | {eta}"
-                    + (f" | {workers_summary}" if workers_summary else "")
-                )
+                line = format_progress(st)
                 if line != last_line:
                     print(line, flush=True)
                     last_line = line
@@ -114,8 +106,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                     break
                 time.sleep(args.poll_interval)
 
-            for t in local_threads:
-                t.join(timeout=10.0)
+            for lh in local_handles:
+                lh.join(timeout=10.0)
 
             final_st = state.status()
             if final_st["failed"] > 0:
@@ -137,9 +129,14 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             print("[blendfleet] All frames rendered cleanly.", flush=True)
             return 0
         except KeyboardInterrupt:
-            print("\n[blendfleet] Interrupted; shutting down coordinator.", flush=True)
+            print("\n[blendfleet] Interrupted; shutting down local workers and coordinator.", flush=True)
+            for lh in local_handles:
+                lh.terminate()
             return 130
         finally:
+            for lh in local_handles:
+                if lh.is_alive:
+                    lh.terminate()
             if tunnel is not None:
                 tunnel.stop()
 
@@ -167,6 +164,7 @@ def _cmd_worker(args: argparse.Namespace) -> int:
         total_workers=args.total_workers,
         lease_ttl=args.lease_ttl,
         use_cpu_with_gpu=args.use_cpu_with_gpu,
+        no_persistent_data=args.no_persistent_data,
         blend_subpath=args.blend_subpath,
     )
 
@@ -285,6 +283,38 @@ def _cmd_account_check(args: argparse.Namespace) -> int:
     return 0 if all(r["ok"] for r in results) else 1
 
 
+def _cmd_account_clean_sessions(args: argparse.Namespace) -> int:
+    aliases = resolve_accounts(args.accounts)
+    if not aliases:
+        if args.json:
+            print("[]")
+        else:
+            print("No saved blendfleet Colab accounts to clean.")
+        return 0
+
+    results = clean_all_account_sessions(aliases, dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        for row in results:
+            if not row["ok"]:
+                print(f"{row['alias']:<18} ERROR      {row.get('error') or ''}")
+                continue
+            found = row.get("found") or []
+            unassigned = row.get("unassigned") or []
+            if not found:
+                print(f"{row['alias']:<18} CLEAN      0 active Colab runtimes")
+            elif args.dry_run:
+                print(
+                    f"{row['alias']:<18} ACTIVE     {len(found)} runtime(s): {', '.join(found)}"
+                )
+            else:
+                print(
+                    f"{row['alias']:<18} UNASSIGNED {len(unassigned)}/{len(found)}: {', '.join(unassigned)}"
+                )
+    return 0 if all(r["ok"] for r in results) else 1
+
+
 def _cmd_account_remove(args: argparse.Namespace) -> int:
     removed = remove_account(args.alias)
     if not removed:
@@ -332,6 +362,9 @@ def _cmd_fly(args: argparse.Namespace) -> int:
         lease_ttl=args.lease_ttl,
         max_retries=args.max_retries,
         poll_interval=args.poll_interval,
+        stagger=args.stagger,
+        drive_cache=args.drive_cache,
+        no_persistent_data=args.no_persistent_data,
         stitch_out=Path(args.stitch_out) if args.stitch_out else None,
         fps=args.fps,
         repo_url=args.repo_url,
@@ -369,6 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
     sv.add_argument("--lease-ttl", type=float, default=300.0)
     sv.add_argument("--max-retries", type=int, default=3)
     sv.add_argument("--poll-interval", type=float, default=2.0)
+    sv.add_argument("--no-persistent-data", action="store_true", help="Disable Cycles use_persistent_data for animated-topology/low-VRAM scenes")
     sv.add_argument("--stitch-out", default=None, help="Optional MP4 path to stitch automatically when complete")
     sv.add_argument("--fps", type=float, default=24.0)
     sv.set_defaults(func=_cmd_serve)
@@ -396,6 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
     wk.add_argument("--samples", type=int, default=None)
     wk.add_argument("--format", dest="file_format", default=None)
     wk.add_argument("--use-cpu-with-gpu", action="store_true")
+    wk.add_argument("--no-persistent-data", action="store_true")
     wk.add_argument("--blend-subpath", default=None)
     wk.set_defaults(func=_cmd_worker)
 
@@ -479,6 +514,23 @@ def build_parser() -> argparse.ArgumentParser:
     ac_check.add_argument("--json", action="store_true", help="Emit JSON output")
     ac_check.set_defaults(func=_cmd_account_check)
 
+    ac_clean = ac_sub.add_parser(
+        "clean-sessions",
+        help="Discover and terminate orphaned server-side Colab runtimes across saved accounts",
+    )
+    ac_clean.add_argument(
+        "--accounts",
+        default="all",
+        help="Comma-separated account aliases or 'all' (default: all)",
+    )
+    ac_clean.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List active server-side assignments without terminating them",
+    )
+    ac_clean.add_argument("--json", action="store_true", help="Emit JSON output")
+    ac_clean.set_defaults(func=_cmd_account_clean_sessions)
+
     ac_rm = ac_sub.add_parser("remove", help="Delete saved credentials for an account alias")
     ac_rm.add_argument("alias", help="Account alias to remove")
     ac_rm.set_defaults(func=_cmd_account_remove)
@@ -501,13 +553,13 @@ def build_parser() -> argparse.ArgumentParser:
     fl.add_argument(
         "--accounts",
         default="all",
-        help="Saved Colab account aliases: 'all', 'none', or comma-separated 'a,b' (default: all)",
+        help="Saved Colab accounts: 'all', 'none', 'a,b', or mixed tiers 'pro1:L4,free1:T4' (default: all)",
     )
     fl.add_argument(
         "--gpu",
         default="T4",
         choices=list(SUPPORTED_GPUS),
-        help="Colab accelerator tier (default: T4)",
+        help="Default Colab accelerator tier (default: T4)",
     )
     fl.add_argument(
         "--local-workers",
@@ -532,9 +584,25 @@ def build_parser() -> argparse.ArgumentParser:
     fl.add_argument("--lease-ttl", type=float, default=300.0)
     fl.add_argument("--max-retries", type=int, default=3)
     fl.add_argument("--poll-interval", type=float, default=2.0)
+    fl.add_argument(
+        "--stagger",
+        type=float,
+        default=1.5,
+        help="Seconds between launching each Colab account to avoid burst throttling (default: 1.5)",
+    )
+    fl.add_argument(
+        "--drive-cache",
+        action="store_true",
+        help="Use /content/drive/MyDrive/blendfleet_cache for Blender archive reuse on Colab",
+    )
+    fl.add_argument(
+        "--no-persistent-data",
+        action="store_true",
+        help="Disable Cycles use_persistent_data for animated-topology or low-VRAM scenes",
+    )
     fl.add_argument("--blender-version", default="5.2.3", help="Target Linux Blender version for Colab workers")
     fl.add_argument("--high-mem", action="store_true", help="Request high-RAM Colab VMs (Pro/Pro+)")
-    fl.add_argument("--repo-url", default=DEFAULT_REPO_URL, help="Git URL installed inside Colab VMs")
+    fl.add_argument("--repo-url", default=DEFAULT_REPO_URL, help="Fallback Git URL if coordinator bundle is unavailable")
     fl.set_defaults(func=_cmd_fly)
 
     return p
@@ -548,7 +616,7 @@ def main(argv: list[str] | None = None) -> int:
     except subprocess.CalledProcessError as exc:
         print(f"[blendfleet] Command failed (exit {exc.returncode})", file=sys.stderr)
         return exc.returncode or 1
-    except (ValueError, FileNotFoundError, RuntimeError) as exc:
+    except (ValueError, FileNotFoundError, RuntimeError, TimeoutError) as exc:
         print(f"[blendfleet] Error: {exc}", file=sys.stderr)
         return 1
 
