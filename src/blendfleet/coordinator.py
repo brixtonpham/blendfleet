@@ -474,7 +474,15 @@ class QuickTunnel:
                 "`mise use -g github:cloudflare/cloudflared`) or pass a Tailscale/public URL."
             )
         self.proc = subprocess.Popen(
-            [binary, "tunnel", "--url", self.local_url, "--no-autoupdate"],
+            [
+                binary,
+                "tunnel",
+                "--config",
+                os.devnull,
+                "--url",
+                self.local_url,
+                "--no-autoupdate",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -482,6 +490,7 @@ class QuickTunnel:
         deadline = time.time() + self.timeout
         assert self.proc.stdout is not None
         found_url: str | None = None
+        registered = False
         while time.time() < deadline:
             line = self.proc.stdout.readline()
             if not line:
@@ -489,8 +498,11 @@ class QuickTunnel:
                     break
                 continue
             match = self.URL_RE.search(line)
-            if match:
+            if match and not found_url:
                 found_url = match.group(0)
+            if "Registered tunnel connection" in line:
+                registered = True
+            if found_url and registered:
                 break
 
         if not found_url:
@@ -506,6 +518,9 @@ class QuickTunnel:
                     pass
 
         threading.Thread(target=_drain, name="cloudflared-drain", daemon=True).start()
+
+        # Brief pause after registration so local DNS doesn't negative-cache NXDOMAIN before CNAME propagates.
+        time.sleep(3.5)
 
         # Wait until the public tunnel actually routes to our local coordinator /health endpoint.
         health_url = f"{found_url}/health"
@@ -523,7 +538,7 @@ class QuickTunnel:
                 pass
             if self.proc.poll() is not None:
                 break
-            time.sleep(1.0)
+            time.sleep(2.0)
 
         self.stop()
         raise TimeoutError(
